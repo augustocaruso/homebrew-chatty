@@ -1,0 +1,359 @@
+diff --git a/pkg/igconnector/backfill.go b/pkg/igconnector/backfill.go
+index b3f5da0..c32fc1f 100644
+--- a/pkg/igconnector/backfill.go
++++ b/pkg/igconnector/backfill.go
+@@ -60,8 +60,6 @@ func (ic *IGClient) fetchForwardBackfill(ctx context.Context, params bridgev2.Fe
+ 		params.Portal.UpdateInfo(ctx, ic.wrapChatInfo(thread), ic.UserLogin, nil, time.Time{})
+ 	}
+ 	canBackwardsBackfill := params.AnchorMessage == nil && ic.Main.Bridge.Config.Backfill.Queue.AnyEnabled()
+-	needsMore := len(thread.SlideMessages.Edges) < params.Count &&
+-		thread.SlideMessages.PageInfo.HasNextPage && !canBackwardsBackfill
+ 	cursor := thread.SlideMessages.PageInfo.EndCursor
+ 	var anchorID string
+ 	var anchorTS time.Time
+@@ -75,23 +73,27 @@ func (ic *IGClient) fetchForwardBackfill(ctx context.Context, params bridgev2.Fe
+ 		anchorTS = params.AnchorMessage.Timestamp
+ 	}
+ 	foundAnchor := false
++	reachedBackfillSince := false
++	hasMoreWithinBackfillWindow := false
+ 	var messages []slidetypes.Node[*slidetypes.Message]
+ 	appendMessages := func(t *slidetypes.SlideMessages) {
++		edges, reachedSince := filterBackfillMessages(t.Edges, ic.Main.Config.backfillSince)
++		reachedBackfillSince = reachedBackfillSince || reachedSince
+ 		if anchorID != "" {
+-			for i, msg := range t.Edges {
++			for i, msg := range edges {
+ 				if msg.Node.ID == anchorID || msg.Node.TimestampMS.Before(anchorTS) {
+ 					foundAnchor = true
+-					t.Edges = t.Edges[:i]
++					edges = edges[:i]
+ 					break
+ 				}
+ 			}
+ 		}
+-		messages = append(messages, t.Edges...)
++		messages = append(messages, edges...)
+ 		cursor = t.PageInfo.EndCursor
+-		needsMore = len(messages) < params.Count && t.PageInfo.HasNextPage
++		hasMoreWithinBackfillWindow = !reachedBackfillSince && t.PageInfo.HasNextPage
+ 	}
+ 	appendMessages(thread.SlideMessages)
+-	for needsMore && !foundAnchor && !canBackwardsBackfill {
++	for len(messages) < params.Count && hasMoreWithinBackfillWindow && !foundAnchor && !canBackwardsBackfill {
+ 		zerolog.Ctx(ctx).Debug().
+ 			Int("collected_count", len(messages)).
+ 			Int("limit", params.Count).
+@@ -112,6 +114,10 @@ func (ic *IGClient) fetchForwardBackfill(ctx context.Context, params bridgev2.Fe
+ 			Msg("Response for pagination")
+ 		appendMessages(resp.ThreadInfo.AsIGDirectThread.Messages)
+ 	}
++	if params.AnchorMessage == nil && !ic.Main.Config.backfillSince.IsZero() &&
++		!reachedBackfillSince && len(messages) >= params.Count && hasMoreWithinBackfillWindow {
++		return nil, fmt.Errorf("initial backfill message limit %d reached before backfill_since %s", params.Count, ic.Main.Config.backfillSince.Format(time.RFC3339))
++	}
+ 	var markRead bool
+ 	for _, rr := range thread.SlideReadReceipts {
+ 		if metaid.MakeUserLoginID(rr.ParticipantFBID) == ic.UserLogin.ID {
+@@ -166,10 +172,12 @@ func (ic *IGClient) fetchBackwardBackfill(ctx context.Context, params bridgev2.F
+ 		zerolog.Ctx(ctx).Trace().
+ 			Any("paginate_response", resp.ThreadInfo.AsIGDirectThread.Messages).
+ 			Msg("Response for backwards pagination")
+-		messages = append(messages, resp.ThreadInfo.AsIGDirectThread.Messages.Edges...)
++		pageMessages := resp.ThreadInfo.AsIGDirectThread.Messages
++		edges, reachedSince := filterBackfillMessages(pageMessages.Edges, ic.Main.Config.backfillSince)
++		messages = append(messages, edges...)
+ 		beforeMessageID = nil
+-		cursor = &resp.ThreadInfo.AsIGDirectThread.Messages.PageInfo.EndCursor
+-		hasMore = resp.ThreadInfo.AsIGDirectThread.Messages.PageInfo.HasNextPage
++		cursor = &pageMessages.PageInfo.EndCursor
++		hasMore = !reachedSince && pageMessages.PageInfo.HasNextPage
+ 	}
+ 	if len(messages) == 0 || cursor == nil {
+ 		return &bridgev2.FetchMessagesResponse{}, nil
+@@ -181,6 +189,20 @@ func (ic *IGClient) fetchBackwardBackfill(ctx context.Context, params bridgev2.F
+ 	}, ctx.Err()
+ }
+ 
++// filterBackfillMessages returns the newest prefix within the optional time window.
++// Instagram pages are ordered newest to oldest, so the first older message ends pagination.
++func filterBackfillMessages(messages []slidetypes.Node[*slidetypes.Message], backfillSince time.Time) ([]slidetypes.Node[*slidetypes.Message], bool) {
++	if backfillSince.IsZero() {
++		return messages, false
++	}
++	for i, msg := range messages {
++		if msg.Node != nil && msg.Node.TimestampMS.Before(backfillSince) {
++			return messages[:i], true
++		}
++	}
++	return messages, false
++}
++
+ func (ic *IGClient) wrapBackfillMessages(
+ 	ctx context.Context, portal *bridgev2.Portal, messages []slidetypes.Node[*slidetypes.Message],
+ ) []*bridgev2.BackfillMessage {
+diff --git a/pkg/igconnector/backfill_since_test.go b/pkg/igconnector/backfill_since_test.go
+new file mode 100644
+index 0000000..f748ba6
+--- /dev/null
++++ b/pkg/igconnector/backfill_since_test.go
+@@ -0,0 +1,154 @@
++package igconnector
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/rs/zerolog"
++	"go.mau.fi/util/jsontime"
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
++	bridgedb "maunium.net/go/mautrix/bridgev2/database"
++
++	"go.mau.fi/mautrix-meta/pkg/instameow"
++	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
++	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
++	"go.mau.fi/mautrix-meta/pkg/messagix/types"
++	"go.mau.fi/mautrix-meta/pkg/metaid"
++)
++
++type backfillRoundTripper func(*http.Request) (*http.Response, error)
++
++func (fn backfillRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
++	return fn(req)
++}
++
++func newBackfillTestClient(since time.Time) *IGClient {
++	testCookies := &cookies.Cookies{Platform: types.Instagram}
++	testCookies.UpdateValues(map[cookies.MetaCookieName]string{})
++	return &IGClient{
++		Main: &IGConnector{
++			Bridge: &bridgev2.Bridge{Config: &bridgeconfig.BridgeConfig{}},
++			Config: Config{backfillSince: since},
++		},
++		Client: instameow.NewClient(instameow.ClientParams{
++			Cookies: testCookies,
++			Log:     zerolog.Nop(),
++		}),
++	}
++}
++
++func backfillMessage(id string, timestamp time.Time) slidetypes.Node[*slidetypes.Message] {
++	return slidetypes.Node[*slidetypes.Message]{
++		Node: &slidetypes.Message{
++			ID:          id,
++			TimestampMS: jsontime.UnixMilliString{Time: timestamp},
++		},
++	}
++}
++
++func backfillTestPortal() *bridgev2.Portal {
++	return &bridgev2.Portal{Portal: &bridgedb.Portal{}}
++}
++
++func TestFilterBackfillMessagesIncludesBoundaryAndStopsAtOlderMessage(t *testing.T) {
++	cutoff := time.Date(2024, 9, 10, 3, 0, 0, 0, time.UTC)
++	messages := []slidetypes.Node[*slidetypes.Message]{
++		backfillMessage("newer", cutoff.Add(time.Millisecond)),
++		backfillMessage("boundary", cutoff),
++		backfillMessage("older", cutoff.Add(-time.Millisecond)),
++	}
++
++	filtered, reached := filterBackfillMessages(messages, cutoff)
++	if !reached {
++		t.Fatal("expected the older message to stop pagination")
++	}
++	if len(filtered) != 2 || filtered[0].Node.ID != "newer" || filtered[1].Node.ID != "boundary" {
++		t.Fatalf("unexpected messages inside the time window: %#v", filtered)
++	}
++}
++
++func TestFilterBackfillMessagesWithoutWindowPreservesBaseline(t *testing.T) {
++	messages := []slidetypes.Node[*slidetypes.Message]{
++		backfillMessage("newer", time.Now()),
++		backfillMessage("older", time.Time{}),
++	}
++
++	filtered, reached := filterBackfillMessages(messages, time.Time{})
++	if reached || len(filtered) != len(messages) || filtered[0].Node.ID != "newer" || filtered[1].Node.ID != "older" {
++		t.Fatalf("empty backfill_since changed the baseline: reached=%t messages=%#v", reached, filtered)
++	}
++}
++
++func TestForwardBackfillStopsAtWindowBeforeConversion(t *testing.T) {
++	cutoff := time.Date(2024, 9, 10, 3, 0, 0, 0, time.UTC)
++	ic := newBackfillTestClient(cutoff)
++	thread := &slidetypes.ThreadInfo{SlideMessages: &slidetypes.SlideMessages{
++		Edges:    []slidetypes.Node[*slidetypes.Message]{backfillMessage("older", cutoff.Add(-time.Millisecond))},
++		PageInfo: slidetypes.PageInfo{HasNextPage: true},
++	}}
++
++	resp, err := ic.fetchForwardBackfill(context.Background(), bridgev2.FetchMessagesParams{
++		Forward:     true,
++		Count:       20,
++		BundledData: thread,
++		Portal:      backfillTestPortal(),
++	}, &metaid.PortalMetadata{})
++	if err != nil {
++		t.Fatalf("forward backfill failed: %v", err)
++	}
++	if len(resp.Messages) != 0 {
++		t.Fatalf("expected no converted messages before backfill_since, got %d", len(resp.Messages))
++	}
++}
++
++func TestForwardInitialBackfillErrorsWhenLimitPrecedesWindow(t *testing.T) {
++	cutoff := time.Date(2024, 9, 10, 3, 0, 0, 0, time.UTC)
++	ic := newBackfillTestClient(cutoff)
++	thread := &slidetypes.ThreadInfo{SlideMessages: &slidetypes.SlideMessages{
++		Edges:    []slidetypes.Node[*slidetypes.Message]{backfillMessage("newer", cutoff.Add(time.Millisecond))},
++		PageInfo: slidetypes.PageInfo{HasNextPage: true},
++	}}
++
++	_, err := ic.fetchForwardBackfill(context.Background(), bridgev2.FetchMessagesParams{
++		Forward:     true,
++		Count:       1,
++		BundledData: thread,
++	}, &metaid.PortalMetadata{})
++	if err == nil || !strings.Contains(err.Error(), "reached before backfill_since") {
++		t.Fatalf("expected explicit incomplete-window error, got %v", err)
++	}
++}
++
++func TestBackwardBackfillStopsPaginationAtWindowBeforeConversion(t *testing.T) {
++	cutoff := time.Date(2024, 9, 10, 3, 0, 0, 0, time.UTC)
++	ic := newBackfillTestClient(cutoff)
++	requestCount := 0
++	ic.Client.GetHTTP().HTTP.Transport = backfillRoundTripper(func(req *http.Request) (*http.Response, error) {
++		requestCount++
++		return &http.Response{
++			StatusCode: http.StatusOK,
++			Header:     make(http.Header),
++			Body:       io.NopCloser(strings.NewReader(`{"data":{"fetch__SlideThread":{"as_ig_direct_thread":{"id":"synthetic-thread","slide_messages":{"edges":[{"node":{"id":"older","timestamp_ms":"1725937199999"}}],"page_info":{"end_cursor":"next-page","has_next_page":true}}}}}}`)),
++			Request:    req,
++		}, nil
++	})
++
++	resp, err := ic.fetchBackwardBackfill(context.Background(), bridgev2.FetchMessagesParams{
++		Count:  20,
++		Cursor: BackfillCursorPrefix + "first-page",
++	}, &metaid.PortalMetadata{IGID: "synthetic-thread"})
++	if err != nil {
++		t.Fatalf("backward backfill failed: %v", err)
++	}
++	if requestCount != 1 {
++		t.Fatalf("expected one native pagination request before cutoff, got %d", requestCount)
++	}
++	if len(resp.Messages) != 0 || resp.HasMore {
++		t.Fatalf("expected cutoff to return no messages and stop pagination, got messages=%d has_more=%t", len(resp.Messages), resp.HasMore)
++	}
++}
+diff --git a/pkg/igconnector/config.go b/pkg/igconnector/config.go
+index afc80b0..fa7d775 100644
+--- a/pkg/igconnector/config.go
++++ b/pkg/igconnector/config.go
+@@ -18,6 +18,7 @@ package igconnector
+ 
+ import (
+ 	_ "embed"
++	"fmt"
+ 	"strings"
+ 	"text/template"
+ 	"time"
+@@ -35,8 +36,10 @@ type Config struct {
+ 	ProxyMedia   bool   `yaml:"proxy_media"`
+ 	ProxyOther   bool   `yaml:"proxy_other"`
+ 
+-	DisableXMABackfill bool `yaml:"disable_xma_backfill"`
+-	DisableXMAAlways   bool `yaml:"disable_xma_always"`
++	DisableXMABackfill bool   `yaml:"disable_xma_backfill"`
++	DisableXMAAlways   bool   `yaml:"disable_xma_always"`
++	BackfillSince      string `yaml:"backfill_since"`
++	backfillSince      time.Time
+ 
+ 	MinFullReconnectIntervalSeconds int  `yaml:"min_full_reconnect_interval_seconds"`
+ 	ForceRefreshIntervalSeconds     int  `yaml:"force_refresh_interval_seconds"`
+@@ -73,6 +76,13 @@ func (c *Config) UnmarshalYAML(node *yaml.Node) error {
+ }
+ 
+ func (c *Config) PostProcess() (err error) {
++	c.backfillSince = time.Time{}
++	if c.BackfillSince != "" {
++		c.backfillSince, err = time.Parse(time.RFC3339, c.BackfillSince)
++		if err != nil {
++			return fmt.Errorf("invalid backfill_since: %w", err)
++		}
++	}
+ 	c.displaynameTemplate, err = template.New("displayname").Parse(c.DisplaynameTemplate)
+ 	return err
+ }
+@@ -88,6 +98,7 @@ func upgradeConfig(helper up.Helper) {
+ 	helper.Copy(up.Bool, "cache_connection_state")
+ 	helper.Copy(up.Bool, "disable_xma_backfill")
+ 	helper.Copy(up.Bool, "disable_xma_always")
++	helper.Copy(up.Str|up.Null, "backfill_since")
+ 	helper.Copy(up.Bool, "disable_typing")
+ 	helper.Copy(up.Bool, "disable_view_once")
+ 	helper.Copy(up.Bool, "log_redacted_login_responses")
+diff --git a/pkg/igconnector/config_backfill_since_test.go b/pkg/igconnector/config_backfill_since_test.go
+new file mode 100644
+index 0000000..eb338e5
+--- /dev/null
++++ b/pkg/igconnector/config_backfill_since_test.go
+@@ -0,0 +1,39 @@
++package igconnector
++
++import (
++	"testing"
++	"time"
++
++	"gopkg.in/yaml.v3"
++)
++
++func TestConfigRejectsInvalidBackfillSince(t *testing.T) {
++	var cfg Config
++	err := yaml.Unmarshal([]byte("backfill_since: not-a-rfc3339-timestamp\n"), &cfg)
++	if err == nil {
++		t.Fatal("expected invalid backfill_since to be rejected")
++	}
++}
++
++func TestConfigParsesOptionalBackfillSince(t *testing.T) {
++	const configured = "2024-09-10T00:00:00-03:00"
++	var cfg Config
++	if err := yaml.Unmarshal([]byte("backfill_since: "+configured+"\n"), &cfg); err != nil {
++		t.Fatalf("failed to parse valid backfill_since: %v", err)
++	}
++	if cfg.BackfillSince != configured {
++		t.Fatalf("backfill_since changed during parsing: %q", cfg.BackfillSince)
++	}
++	expected, _ := time.Parse(time.RFC3339, configured)
++	if !cfg.backfillSince.Equal(expected) {
++		t.Fatalf("parsed cutoff = %s, want %s", cfg.backfillSince, expected)
++	}
++
++	var omitted Config
++	if err := yaml.Unmarshal([]byte("disable_typing: true\n"), &omitted); err != nil {
++		t.Fatalf("failed to parse config without backfill_since: %v", err)
++	}
++	if !omitted.backfillSince.IsZero() {
++		t.Fatalf("omitted backfill_since should preserve baseline, got %s", omitted.backfillSince)
++	}
++}
+diff --git a/pkg/igconnector/example-config.yaml b/pkg/igconnector/example-config.yaml
+index 37ab6a3..8241779 100644
+--- a/pkg/igconnector/example-config.yaml
++++ b/pkg/igconnector/example-config.yaml
+@@ -23,6 +23,8 @@ cache_connection_state: true
+ disable_xma_backfill: true
+ # Disable fetching XMA media entirely.
+ disable_xma_always: false
++# Do not backfill messages before this RFC3339 timestamp. Empty disables the time window.
++backfill_since:
+ # Should typing notification bridging be disabled?
+ # Bridging typing notifications requires 2 extra connections per user (one for receiving and one for sending),
+ # because Meta only employs professional software engineers who make excellent architecture decisions.

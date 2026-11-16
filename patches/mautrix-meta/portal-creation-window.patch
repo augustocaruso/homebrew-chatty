@@ -1,0 +1,136 @@
+diff --git a/pkg/igconnector/handlemeta.go b/pkg/igconnector/handlemeta.go
+index fd7ff11..f545dc3 100644
+--- a/pkg/igconnector/handlemeta.go
++++ b/pkg/igconnector/handlemeta.go
+@@ -177,6 +177,21 @@ func (ic *IGClient) handleIGEvent(ctx context.Context, rawEvt slidetypes.ClientE
+ 	}
+ }
+ 
++func (ic *IGClient) shouldCreatePortalForBackfill(thread *slidetypes.ThreadInfo) bool {
++	backfillSince := ic.Main.Config.backfillSince
++	if backfillSince.IsZero() || !thread.LastActivityTimestampMS.Before(backfillSince) {
++		return true
++	}
++	if thread.SlideMessages != nil {
++		for _, edge := range thread.SlideMessages.Edges {
++			if edge.Node != nil && !edge.Node.TimestampMS.Before(backfillSince) {
++				return true
++			}
++		}
++	}
++	return false
++}
++
+ func (ic *IGClient) wrapChatResync(thread *slidetypes.ThreadInfo, useBundle bool, source string) *simplevent.ChatResync {
+ 	var bundle any
+ 	// Fetching the entire inbox only returns stub messages which can't be used safely for backfilling.
+@@ -188,7 +203,7 @@ func (ic *IGClient) wrapChatResync(thread *slidetypes.ThreadInfo, useBundle bool
+ 		EventMeta: simplevent.EventMeta{
+ 			Type:         bridgev2.RemoteEventChatResync,
+ 			PortalKey:    ic.makePortalKey(thread.ThreadKey, thread.IsGroup),
+-			CreatePortal: true,
++			CreatePortal: ic.shouldCreatePortalForBackfill(thread),
+ 			LogContext: func(c zerolog.Context) zerolog.Context {
+ 				return c.Str("resync_source", source)
+ 			},
+diff --git a/pkg/igconnector/portal_creation_window_test.go b/pkg/igconnector/portal_creation_window_test.go
+new file mode 100644
+index 0000000..8b9b9ed
+--- /dev/null
++++ b/pkg/igconnector/portal_creation_window_test.go
+@@ -0,0 +1,95 @@
++package igconnector
++
++import (
++	"testing"
++	"time"
++
++	"go.mau.fi/util/jsontime"
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
++	bridgedb "maunium.net/go/mautrix/bridgev2/database"
++
++	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
++)
++
++func TestChatResyncCreatesPortalOnlyWithinBackfillWindow(t *testing.T) {
++	cutoff := time.Date(2024, 9, 10, 3, 0, 0, 0, time.UTC)
++	tests := []struct {
++		name          string
++		backfillSince time.Time
++		lastActivity  time.Time
++		messageAt     time.Time
++		wantCreate    bool
++	}{
++		{
++			name:          "old thread with configured window",
++			backfillSince: cutoff,
++			lastActivity:  cutoff.Add(-time.Millisecond),
++			wantCreate:    false,
++		},
++		{
++			name:          "thread at window boundary",
++			backfillSince: cutoff,
++			lastActivity:  cutoff,
++			wantCreate:    true,
++		},
++		{
++			name:          "thread after window",
++			backfillSince: cutoff,
++			lastActivity:  cutoff.Add(time.Millisecond),
++			wantCreate:    true,
++		},
++		{
++			name:          "message in window overrides stale thread activity",
++			backfillSince: cutoff,
++			lastActivity:  cutoff.Add(-time.Millisecond),
++			messageAt:     cutoff,
++			wantCreate:    true,
++		},
++		{
++			name:         "window disabled",
++			lastActivity: cutoff.Add(-time.Hour),
++			wantCreate:   true,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			config := Config{
++				BackfillSince:       test.backfillSince.Format(time.RFC3339Nano),
++				DisplaynameTemplate: "{{.DisplayName}}",
++			}
++			if test.backfillSince.IsZero() {
++				config.BackfillSince = ""
++			}
++			if err := config.PostProcess(); err != nil {
++				t.Fatalf("failed to configure test client: %v", err)
++			}
++			client := &IGClient{
++				Main: &IGConnector{
++					Bridge: &bridgev2.Bridge{Config: &bridgeconfig.BridgeConfig{}},
++					Config: config,
++				},
++				UserLogin: &bridgev2.UserLogin{UserLogin: &bridgedb.UserLogin{ID: "instagram:1"}},
++			}
++			thread := &slidetypes.ThreadInfo{
++				ID:                      "1",
++				ThreadFBID:              "1",
++				ThreadKey:               1,
++				IsGroup:                 true,
++				Viewer:                  &slidetypes.User{},
++				LastActivityTimestampMS: jsontime.UnixMilliString{Time: test.lastActivity},
++			}
++			if !test.messageAt.IsZero() {
++				thread.SlideMessages = &slidetypes.SlideMessages{Edges: []slidetypes.Node[*slidetypes.Message]{{
++					Node: &slidetypes.Message{TimestampMS: jsontime.UnixMilliString{Time: test.messageAt}},
++				}}}
++			}
++
++			event := client.wrapChatResync(thread, false, "backfill")
++			if event.CreatePortal != test.wantCreate {
++				t.Fatalf("CreatePortal = %t, want %t", event.CreatePortal, test.wantCreate)
++			}
++		})
++	}
++}

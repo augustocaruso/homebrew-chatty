@@ -1,0 +1,104 @@
+diff --git a/pkg/igconnector/chatsync.go b/pkg/igconnector/chatsync.go
+index 9d3724a..a45b567 100644
+--- a/pkg/igconnector/chatsync.go
++++ b/pkg/igconnector/chatsync.go
+@@ -139,6 +139,10 @@ func (ic *IGClient) doChatBackfill(ctx context.Context, cursor string, since tim
+ 	processThreads := func(threads slidetypes.Edged[slidetypes.Node[slidetypes.WrappedThreadInfo]]) bool {
+ 		cursor = threads.PageInfo.EndCursor
+ 		hasMore = threads.PageInfo.HasNextPage
++		if hasMore && cursor == "" {
++			log.Warn().Msg("Inbox page has more threads but no pagination cursor")
++			return false
++		}
+ 		for _, edge := range threads.Edges {
+ 			if !since.IsZero() && edge.Node.AsIGDirectThread.LastActivityTimestampMS.Before(since) {
+ 				hasMore = false
+diff --git a/pkg/igconnector/chatsync_cursor_test.go b/pkg/igconnector/chatsync_cursor_test.go
+new file mode 100644
+index 0000000..be6f7c9
+--- /dev/null
++++ b/pkg/igconnector/chatsync_cursor_test.go
+@@ -0,0 +1,83 @@
++package igconnector
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++
++	_ "github.com/mattn/go-sqlite3"
++	"go.mau.fi/util/dbutil"
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/bridgev2/database"
++
++	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
++	"go.mau.fi/mautrix-meta/pkg/metaid"
++)
++
++func TestThreadBackfillCursorCompletion(t *testing.T) {
++	tests := []struct {
++		name          string
++		start         string
++		pages         []slidetypes.PageInfo
++		limit         int
++		since         time.Time
++		wantCompleted bool
++	}{
++		{name: "initial page missing cursor", pages: []slidetypes.PageInfo{{HasNextPage: true}}, limit: -1},
++		{name: "later page missing cursor even at cap", start: "first", pages: []slidetypes.PageInfo{{HasNextPage: true}}, limit: 2},
++		{name: "natural end without cursor", start: "first", pages: []slidetypes.PageInfo{{}}, limit: -1, wantCompleted: true},
++		{name: "unlimited advances cursor", start: "first", pages: []slidetypes.PageInfo{{EndCursor: "second", HasNextPage: true}, {}}, limit: -1, wantCompleted: true},
++		{name: "valid cursor at configured cap", start: "first", pages: []slidetypes.PageInfo{{EndCursor: "second", HasNextPage: true}}, limit: 2, wantCompleted: true},
++		{name: "resnapshot does not mark initial backfill", start: "first", pages: []slidetypes.PageInfo{{}}, limit: -1, since: time.Unix(1, 0)},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			ctx := context.Background()
++			db, err := dbutil.NewWithDialect(":memory:", "sqlite3")
++			if err != nil {
++				t.Fatal(err)
++			}
++			db.RawDB.SetMaxOpenConns(1)
++			t.Cleanup(func() { _ = db.Close() })
++			bridgeDB := database.New("synthetic", database.MetaTypes{}, db)
++			if err = bridgeDB.Upgrade(ctx); err != nil {
++				t.Fatal(err)
++			}
++			client := newBackfillTestClient(time.Time{})
++			client.Main.Config.ThreadBackfill.BatchCount = test.limit
++			client.Main.Bridge.DB = bridgeDB
++			client.LoginMeta = &metaid.UserLoginMetadata{}
++			client.UserLogin = &bridgev2.UserLogin{Bridge: client.Main.Bridge, UserLogin: &database.UserLogin{ID: "1", Metadata: client.LoginMeta}}
++			requests := 0
++			client.Client.GetHTTP().HTTP.Transport = backfillRoundTripper(func(req *http.Request) (*http.Response, error) {
++				index := requests
++				requests++
++				var data any = map[string]any{}
++				if index < len(test.pages) {
++					page := slidetypes.Edged[slidetypes.Node[slidetypes.WrappedThreadInfo]]{PageInfo: test.pages[index]}
++					if test.start == "" && index == 0 {
++						data = &slidetypes.MailboxResponse{Mailbox: &slidetypes.Mailbox{ThreadsByFolder: page}}
++					} else {
++						data = &slidetypes.PaginateMailboxResponse{Mailbox: &slidetypes.MailboxPage{ThreadsByFolder: page}}
++					}
++				}
++				body, err := json.Marshal(map[string]any{"data": data})
++				if err != nil {
++					t.Fatal(err)
++				}
++				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))), Request: req}, nil
++			})
++			client.doChatBackfill(ctx, test.start, test.since)
++			if client.LoginMeta.BackfillCompleted != test.wantCompleted {
++				t.Fatalf("BackfillCompleted=%t, want %t", client.LoginMeta.BackfillCompleted, test.wantCompleted)
++			}
++			if requests != len(test.pages) {
++				t.Fatalf("requests=%d, want %d; pagination continued without a usable cursor", requests, len(test.pages))
++			}
++		})
++	}
++}

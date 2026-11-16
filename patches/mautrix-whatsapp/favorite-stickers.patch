@@ -1,0 +1,2029 @@
+diff --git a/pkg/connector/client.go b/pkg/connector/client.go
+index 61fceecfc21bf42032611b1feaff79efaca52bab..af7196f48b64c065b0914c8dd7ce094653d38912 100644
+--- a/pkg/connector/client.go
++++ b/pkg/connector/client.go
+@@ -76,6 +76,7 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
+ 	if w.Device != nil {
+ 		log := w.UserLogin.Log.With().Str("component", "whatsmeow").Logger()
+ 		w.Client = whatsmeow.NewClient(w.Device, waLog.Zerolog(log))
++		w.Client.EmitFavoriteStickerEvents = true
+ 		w.Client.AddEventHandlerWithSuccessStatus(w.handleWAEvent)
+ 		w.Client.SynchronousAck = true
+ 		w.Client.EnableDecryptedEventBuffer = wa.Bridge.Config.PortalEventBuffer == 0
+@@ -109,20 +110,23 @@ type WhatsAppClient struct {
+ 	LID       types.JID
+ 	MC        mClient
+ 
+-	historySyncWakeup  chan struct{}
+-	stopLoops          atomic.Pointer[context.CancelFunc]
+-	resyncQueue        map[types.JID]resyncQueueItem
+-	resyncQueueLock    sync.Mutex
+-	nextResync         time.Time
+-	directMediaRetries map[networkid.MessageID]*directMediaRetry
+-	directMediaLock    sync.Mutex
+-	avatarLock         exsync.KeyedMutex[types.JID]
+-	mediaRetryLock     *semaphore.Weighted
+-	offlineSyncWaiter  atomic.Pointer[chan error]
+-	isNewLogin         bool
+-	pushNamesSynced    *exsync.Event
+-	lastPresence       types.Presence
+-	blocklistLock      sync.Mutex
++	historySyncWakeup                chan struct{}
++	stopLoops                        atomic.Pointer[context.CancelFunc]
++	resyncQueue                      map[types.JID]resyncQueueItem
++	resyncQueueLock                  sync.Mutex
++	nextResync                       time.Time
++	directMediaRetries               map[networkid.MessageID]*directMediaRetry
++	directMediaLock                  sync.Mutex
++	avatarLock                       exsync.KeyedMutex[types.JID]
++	mediaRetryLock                   *semaphore.Weighted
++	offlineSyncWaiter                atomic.Pointer[chan error]
++	isNewLogin                       bool
++	pushNamesSynced                  *exsync.Event
++	lastPresence                     types.Presence
++	blocklistLock                    sync.Mutex
++	favoriteStickerSnapshotSeen      atomic.Bool
++	favoriteStickerSnapshotRequested atomic.Bool
++	favoriteStickerRetries           *favoriteStickerRetryState
+ 
+ 	disableNewsletter bool
+ 
+@@ -390,6 +394,7 @@ func (wa *WhatsAppClient) callStopLoops() {
+ }
+ 
+ func (wa *WhatsAppClient) Disconnect() {
++	wa.pauseFavoriteStickerRetries()
+ 	wa.callStopLoops()
+ 	if cli := wa.Client; cli != nil {
+ 		cli.Disconnect()
+diff --git a/pkg/connector/connector.go b/pkg/connector/connector.go
+index d7261d3ad17e51701096f704c043cbd40dd4f531..2877793cb815454ab097e9b128fecfba2ef4c94e 100644
+--- a/pkg/connector/connector.go
++++ b/pkg/connector/connector.go
+@@ -62,7 +62,8 @@ type WhatsAppConnector struct {
+ 	mediaEditCacheLock     sync.RWMutex
+ 	stopMediaEditCacheLoop atomic.Pointer[context.CancelFunc]
+ 
+-	unmigratedDMs *exsync.Set[networkid.PortalKey]
++	unmigratedDMs       *exsync.Set[networkid.PortalKey]
++	favoriteStickerLock exsync.KeyedMutex[id.UserID]
+ }
+ 
+ func init() {
+diff --git a/pkg/connector/favorite_backoff_test.go b/pkg/connector/favorite_backoff_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..18901b5518cbdc8675f66f9ec030f05b441438a1
+--- /dev/null
++++ b/pkg/connector/favorite_backoff_test.go
+@@ -0,0 +1,38 @@
++package connector
++
++import (
++	"bytes"
++	"context"
++	"testing"
++
++	"go.mau.fi/whatsmeow"
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/proto/waE2E"
++	"go.mau.fi/whatsmeow/types/events"
++)
++
++func TestFavoriteForbiddenDoesNotBlockBatch(t *testing.T) {
++	state, client := newSyntheticFavoriteServer(t)
++	prefix := favoriteStickerPrefix("synthetic-login")
++	bad, first, second := []byte("expired synthetic"), []byte("good synthetic one"), []byte("good synthetic two")
++	mutations := []appstate.Mutation{syntheticFavorite(bad, false), syntheticFavorite(first, false), syntheticFavorite(second, false)}
++	_ = syncFavoriteStickers(context.Background(), client, prefix, &events.FavoriteStickerSync{FromFullSync: true, Mutations: mutations}, func(_ context.Context, msg *waE2E.StickerMessage) ([]byte, error) {
++		if bytes.Equal(msg.FileSHA256, sha256Bytes(bad)) {
++			return nil, whatsmeow.ErrMediaDownloadFailedWith403
++		}
++		if bytes.Equal(msg.FileSHA256, sha256Bytes(first)) {
++			return first, nil
++		}
++		return second, nil
++	})
++	images := syntheticImages(t, state)
++	for _, mutation := range mutations[1:] {
++		change, _ := favoriteStickerMutation(prefix, mutation)
++		if !ownedFavoriteSticker(prefix, change.Key, images[change.Key]) {
++			t.Fatal("one 403 blocked an available favorite")
++		}
++	}
++	if len(images) != 3 || state.writes != 1 || len(state.uploads) != 2 {
++		t.Fatal("partial publication lost foreign data or uploaded failed media")
++	}
++}
+diff --git a/pkg/connector/favorite_lifecycle_test.go b/pkg/connector/favorite_lifecycle_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..72dec4a50d947dac620dc9a3148f104a04d52e5f
+--- /dev/null
++++ b/pkg/connector/favorite_lifecycle_test.go
+@@ -0,0 +1,43 @@
++package connector
++
++import (
++	"context"
++	"testing"
++
++	"go.mau.fi/whatsmeow"
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/proto/waE2E"
++	"go.mau.fi/whatsmeow/types/events"
++)
++
++func TestFavoriteRetryStopsAndResumesWithClient(t *testing.T) {
++	attempts := 0
++	fixture := newFavoriteRetryFixture(t, func(context.Context, *waE2E.StickerMessage) ([]byte, error) {
++		attempts++
++		return nil, whatsmeow.ErrMediaDownloadFailedWith403
++	})
++	ctx, cancel := context.WithCancel(context.Background())
++	t.Cleanup(cancel)
++	fixture.wa.Main.Bridge.BackgroundCtx = ctx
++	batch := &events.FavoriteStickerSync{Mutations: []appstate.Mutation{syntheticFavorite([]byte("synthetic lifecycle"), false)}}
++	if !fixture.wa.handleWAEvent(batch) {
++		t.Fatal("initial defer failed")
++	}
++	stale := fixture.fire
++	fixture.wa.Disconnect()
++	stale()
++	if fixture.wa.handleWAEvent(batch) || attempts != 1 {
++		t.Fatal("disconnected client retried media")
++	}
++	fixture.wa.resumeFavoriteStickerRetries(fixture.wa.Main.Bridge.BackgroundCtx)
++	fixture.advance(t)
++	if attempts != 2 || len(fixture.wa.favoriteStickerRetries.pending) != 1 {
++		t.Fatal("reconnect lost pending retry")
++	}
++	cancel()
++	stale = fixture.fire
++	stale()
++	if attempts != 2 || fixture.wa.handleFavoriteStickerSync(ctx, batch) {
++		t.Fatal("canceled context retried or acknowledged media")
++	}
++}
+diff --git a/pkg/connector/favorite_partial_test.go b/pkg/connector/favorite_partial_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..71efd129056c94696275e82df5218797dd5c8f1b
+--- /dev/null
++++ b/pkg/connector/favorite_partial_test.go
+@@ -0,0 +1,100 @@
++package connector
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"testing"
++	"time"
++
++	"go.mau.fi/whatsmeow"
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/proto/waE2E"
++	"go.mau.fi/whatsmeow/proto/waServerSync"
++	"go.mau.fi/whatsmeow/store"
++	"go.mau.fi/whatsmeow/types/events"
++	waLog "go.mau.fi/whatsmeow/util/log"
++)
++
++func TestFavoriteForbiddenPreservesPublishedAndOrdersChanges(t *testing.T) {
++	for _, removeLast := range []bool{false, true} {
++		t.Run(map[bool]string{false: "set_wins", true: "remove_wins"}[removeLast], func(t *testing.T) {
++			bad, old, good := []byte("synthetic expired"), []byte("synthetic published"), []byte("synthetic good")
++			fixture := newFavoriteRetryFixture(t, func(_ context.Context, msg *waE2E.StickerMessage) ([]byte, error) {
++				if bytes.Equal(msg.FileSHA256, sha256Bytes(bad)) {
++					return nil, whatsmeow.ErrMediaDownloadFailedWith403
++				}
++				if bytes.Equal(msg.FileSHA256, sha256Bytes(old)) {
++					t.Fatal("already published media was downloaded again")
++				}
++				return good, nil
++			})
++			prefix := favoriteStickerPrefix("synthetic-login")
++			oldMutation := syntheticFavorite(old, false)
++			oldChange, _ := favoriteStickerMutation(prefix, oldMutation)
++			oldEntry := favoriteStickerEntry(oldChange, favoriteStickerMedia{Data: old, MimeType: "image/webp"}, "mxc://synthetic/existing", "")
++			fixture.matrix.content["images"], _ = json.Marshal(map[string]json.RawMessage{oldChange.Key: oldEntry, "other_client": json.RawMessage(`{"url":"mxc://synthetic/foreign"}`)})
++			set := syntheticFavorite(good, false)
++			remove := cloneFavoriteMutation(set)
++			remove.Operation = waServerSync.SyncdMutation_REMOVE
++			remove.Action = nil
++			changes := []appstate.Mutation{syntheticFavorite(bad, false), oldMutation, remove, set}
++			if removeLast {
++				changes = append(changes, remove)
++			}
++			if !fixture.wa.handleWAEvent(&events.FavoriteStickerSync{FromFullSync: true, Mutations: changes}) {
++				t.Fatal("partial snapshot failed")
++			}
++			images := syntheticImages(t, fixture.matrix)
++			goodChange, _ := favoriteStickerMutation(prefix, set)
++			if images[oldChange.Key] == nil || images["other_client"] == nil || (images[goodChange.Key] != nil) == removeLast {
++				t.Fatal("failed download lost published entries or violated last mutation order")
++			}
++		})
++	}
++}
++
++func TestFavoriteQueueDoesNotRetryPublishedPartialBatch(t *testing.T) {
++	data := []byte("synthetic expired delta")
++	fixture := newFavoriteRetryFixture(t, func(context.Context, *waE2E.StickerMessage) ([]byte, error) {
++		return nil, whatsmeow.ErrMediaDownloadFailedWith403
++	})
++	memory := &favoritePipelineStore{macs: make(map[string][]byte)}
++	cli := whatsmeow.NewClient(&store.Device{AppState: memory, AppStateKeys: memory}, waLog.Noop)
++	cli.EmitFavoriteStickerEvents = true
++	cli.BackgroundEventCtx = fixture.wa.Main.Bridge.BackgroundCtx
++	delivered := make(chan bool, 4)
++	cli.AddEventHandlerWithSuccessStatus(func(raw any) bool {
++		if _, ok := raw.(*events.FavoriteStickerSync); !ok {
++			return true
++		}
++		success := fixture.wa.handleWAEvent(raw)
++		delivered <- success
++		return success
++	})
++	mutation := syntheticFavorite(data, false)
++	applySyntheticFavoriteDelta(t, cli, mutation)
++	await := func() {
++		t.Helper()
++		select {
++		case success := <-delivered:
++			if !success {
++				t.Fatal("expired media kept batch queued")
++			}
++		case <-time.After(4 * time.Second):
++			t.Fatal("favorite queue did not advance")
++		}
++	}
++	await()
++	// EncodePatch usa SET; isFavorite=false exerce a remoção na mesma fila real.
++	mutation = syntheticFavorite(data, false)
++	mutation.Action.StickerAction.IsFavorite = new(false)
++	applySyntheticFavoriteDelta(t, cli, mutation)
++	await()
++	fixture.wa.Main.favoriteStickerLock.Lock(fixture.wa.UserLogin.User.MXID)
++	pending := len(fixture.wa.favoriteStickerRetries.pending)
++	fixture.wa.Main.favoriteStickerLock.Unlock(fixture.wa.UserLogin.User.MXID)
++	if pending != 0 || len(syntheticImages(t, fixture.matrix)) != 1 {
++		t.Fatal("queue retained expired favorite after remove")
++	}
++}
+diff --git a/pkg/connector/favorite_reliability_test.go b/pkg/connector/favorite_reliability_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..1825243ccf7b2873e5a4adb2c150f97db01bd1e5
+--- /dev/null
++++ b/pkg/connector/favorite_reliability_test.go
+@@ -0,0 +1,261 @@
++package connector
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/rs/zerolog"
++	"maunium.net/go/mautrix/appservice"
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/bridgev2/database"
++	"maunium.net/go/mautrix/bridgev2/matrix"
++
++	"go.mau.fi/mautrix-whatsapp/pkg/msgconv"
++
++	"go.mau.fi/whatsmeow"
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/proto/waE2E"
++	"go.mau.fi/whatsmeow/proto/waServerSync"
++	"go.mau.fi/whatsmeow/store"
++	"go.mau.fi/whatsmeow/types/events"
++	waLog "go.mau.fi/whatsmeow/util/log"
++	"google.golang.org/protobuf/proto"
++)
++
++func TestFavoriteHandlerDoesNotLogMediaSecrets(t *testing.T) {
++	const marker = "SYNTHETIC_HANDLER_PRIVATE_QUERY"
++	state, client := newSyntheticFavoriteServer(t)
++	var logs bytes.Buffer
++	logger := zerolog.New(&logs).Level(zerolog.TraceLevel)
++	service, err := appservice.CreateFull(appservice.CreateOpts{Registration: &appservice.Registration{SenderLocalpart: "synthetic-bot"}, HomeserverDomain: "example.invalid", HomeserverURL: client.HomeserverURL.String()})
++	if err != nil {
++		t.Fatal(err)
++	}
++	service.DoublePuppetValue = "synthetic-whatsapp"
++	puppet := service.NewIntentAPI("synthetic")
++	puppet.Client = client
++	puppet.IsCustomPuppet = true
++	ctx, cancel := context.WithCancel(context.Background())
++	t.Cleanup(cancel)
++	bridge := &bridgev2.Bridge{BackgroundCtx: ctx, Matrix: &syntheticFavoriteMatrix{intent: &matrix.ASIntent{Matrix: puppet}}}
++	login := &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "synthetic-login"}, Log: logger}
++	login.User = &bridgev2.User{User: &database.User{MXID: client.UserID, AccessToken: "synthetic-token"}, Bridge: bridge, Log: logger}
++	wa := &WhatsAppClient{Main: &WhatsAppConnector{Bridge: bridge}, UserLogin: login, MC: noopMCInstance, Client: whatsmeow.NewClient(&store.Device{}, waLog.Zerolog(logger))}
++	mutation := syntheticFavorite([]byte("synthetic original"), false)
++	mutation.Action.StickerAction.DirectPath = proto.String("invalid?token=" + marker)
++	if !wa.handleWAEvent(&events.FavoriteStickerSync{Mutations: []appstate.Mutation{mutation}}) {
++		t.Fatal("failed media kept the whole batch in the whatsmeow queue")
++	}
++	if strings.Contains(logs.String(), marker) {
++		t.Fatal("real bridge handler leaked media query in logs")
++	}
++	if !strings.Contains(logs.String(), "error_type") || !strings.Contains(logs.String(), "Favorite sticker download deferred") {
++		t.Fatal("sanitized media failure diagnostic was hidden")
++	}
++	if state.writes != 0 || len(state.uploads) != 0 {
++		t.Fatal("failed download caused a Matrix effect")
++	}
++}
++
++type favoritePipelineStore struct {
++	store.NoopStore
++	mu    sync.Mutex
++	state appstate.HashState
++	macs  map[string][]byte
++}
++
++func (s *favoritePipelineStore) GetAppStateSyncKey(context.Context, []byte) (*store.AppStateSyncKey, error) {
++	return &store.AppStateSyncKey{Data: bytes.Repeat([]byte{7}, 32)}, nil
++}
++func (s *favoritePipelineStore) PutAppStateVersion(_ context.Context, _ string, version uint64, hash [128]byte) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.state = appstate.HashState{Version: version, Hash: hash}
++	return nil
++}
++func (s *favoritePipelineStore) GetAppStateVersion(context.Context, string) (uint64, [128]byte, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.state.Version, s.state.Hash, nil
++}
++func (s *favoritePipelineStore) GetAppStateMutationMAC(_ context.Context, _ string, index []byte) ([]byte, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.macs[string(index)], nil
++}
++func (s *favoritePipelineStore) PutAppStateMutationMACs(_ context.Context, _ string, _ uint64, macs []store.AppStateMutationMAC) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for _, mac := range macs {
++		s.macs[string(mac.IndexMAC)] = mac.ValueMAC
++	}
++	return nil
++}
++func (s *favoritePipelineStore) DeleteAppStateMutationMACs(_ context.Context, _ string, indexes [][]byte) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for _, index := range indexes {
++		delete(s.macs, string(index))
++	}
++	return nil
++}
++
++func applySyntheticFavoriteDelta(t *testing.T, cli *whatsmeow.Client, mutation appstate.Mutation) {
++	t.Helper()
++	ctx := cli.BackgroundEventCtx
++	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, "regular_low")
++	if err != nil {
++		t.Fatal(err)
++	}
++	state := appstate.HashState{Version: version, Hash: hash}
++	encoder := appstate.NewProcessor(cli.Store, waLog.Noop)
++	raw, err := encoder.EncodePatch(ctx, []byte{1}, state, appstate.PatchInfo{Type: appstate.WAPatchRegularLow, Timestamp: time.UnixMilli(100), Mutations: []appstate.MutationInfo{{Index: mutation.Index, Version: 1, Value: mutation.Action}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	patch := &waServerSync.SyncdPatch{}
++	if err = proto.Unmarshal(raw, patch); err != nil {
++		t.Fatal(err)
++	}
++	patch.Version = &waServerSync.SyncdVersion{Version: proto.Uint64(version + 1)}
++	var collected []any
++	if _, err = cli.DangerousInternals().ApplyAppStatePatches(ctx, appstate.WAPatchRegularLow, state, &appstate.PatchList{Name: appstate.WAPatchRegularLow, Patches: []*waServerSync.SyncdPatch{patch}}, false, &collected); err != nil {
++		t.Fatal(err)
++	}
++	for _, event := range collected {
++		cli.DangerousInternals().DispatchEvent(event)
++	}
++}
++
++func awaitFavoritePipeline(t *testing.T, ch <-chan struct{}, reason string) {
++	t.Helper()
++	select {
++	case <-ch:
++	case <-time.After(4 * time.Second):
++		t.Fatal(reason)
++	}
++}
++
++func TestFavoritePipelineRetriesMatrixFailures(t *testing.T) {
++	for _, scenario := range []string{"read", "download", "original_upload", "animation_upload", "put", "remove_put"} {
++		t.Run(scenario, func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++			defer cancel()
++			state, matrixClient := newSyntheticFavoriteServer(t)
++			prefix := favoriteStickerPrefix("synthetic-login")
++			initial := []byte("initial successful snapshot")
++			starter := syntheticFavorite(initial, false)
++			if err := syncFavoriteStickers(ctx, matrixClient, prefix, &events.FavoriteStickerSync{FromFullSync: true, Mutations: []appstate.Mutation{starter}}, func(context.Context, *waE2E.StickerMessage) ([]byte, error) { return initial, nil }); err != nil {
++				t.Fatal(err)
++			}
++			data := []byte("new favorite after successful initial snapshot")
++			if scenario == "animation_upload" {
++				var err error
++				data, err = msgconv.PackAnimatedSticker([]byte(`{"v":"5.7.4","fr":30,"ip":0,"op":30,"w":512,"h":512,"layers":[]}`))
++				if err != nil {
++					t.Fatal(err)
++				}
++			}
++			mutation := syntheticFavorite(data, scenario == "animation_upload")
++			if scenario == "remove_put" {
++				mutation = starter
++				mutation.Action.StickerAction.IsFavorite = proto.Bool(false)
++			}
++			change, err := favoriteStickerMutation(prefix, mutation)
++			if err != nil {
++				t.Fatal(err)
++			}
++			state.mu.Lock()
++			beforeWrites := state.writes
++			switch scenario {
++			case "read":
++				state.readError = 403
++			case "original_upload":
++				state.uploadError = 500
++			case "animation_upload":
++				state.uploadError = 500
++				state.uploadErrorAt = state.uploadCalls + 2
++			case "put", "remove_put":
++				state.writeError = 403
++			}
++			state.mu.Unlock()
++			var recovered atomic.Bool
++			var downloads atomic.Int32
++			memory := &favoritePipelineStore{macs: make(map[string][]byte)}
++			cli := whatsmeow.NewClient(&store.Device{AppState: memory, AppStateKeys: memory}, waLog.Noop)
++			cli.EmitFavoriteStickerEvents = true
++			cli.BackgroundEventCtx = ctx
++			failed, published := make(chan struct{}, 8), make(chan struct{}, 8)
++			cli.AddEventHandlerWithSuccessStatus(func(raw any) bool {
++				batch, ok := raw.(*events.FavoriteStickerSync)
++				if !ok {
++					return true
++				}
++				err := syncFavoriteStickers(ctx, matrixClient, prefix, batch, func(context.Context, *waE2E.StickerMessage) ([]byte, error) {
++					downloads.Add(1)
++					if scenario == "download" && !recovered.Load() {
++						return nil, errors.New("synthetic network outage")
++					}
++					return data, nil
++				})
++				if err != nil {
++					failed <- struct{}{}
++					return false
++				}
++				published <- struct{}{}
++				return true
++			})
++			applySyntheticFavoriteDelta(t, cli, mutation)
++			awaitFavoritePipeline(t, failed, "Matrix failure was not exercised through decode/dispatch")
++			state.mu.Lock()
++			if state.writes != beforeWrites {
++				state.mu.Unlock()
++				t.Fatal("failed effect published a partial pack")
++			}
++			state.readError = 0
++			state.uploadError = 0
++			state.uploadErrorAt = 0
++			state.writeError = 0
++			state.mu.Unlock()
++			beforeVersion, beforeHash, _ := memory.GetAppStateVersion(ctx, "regular_low")
++			recovered.Store(true)
++			awaitFavoritePipeline(t, published, "lost Matrix/media effect after app-state version advance")
++			images := syntheticImages(t, state)
++			if images["other_client"] == nil {
++				t.Fatal("retry removed third-party sticker")
++			}
++			if scenario == "remove_put" {
++				if images[change.Key] != nil {
++					t.Fatal("unfavorite was not recovered")
++				}
++			} else if !ownedFavoriteSticker(prefix, change.Key, images[change.Key]) {
++				t.Fatal("favorite was not recovered")
++			}
++			afterVersion, afterHash, _ := memory.GetAppStateVersion(ctx, "regular_low")
++			if beforeVersion != afterVersion || beforeHash != afterHash {
++				t.Fatal("retry rewound or advanced app-state cryptography")
++			}
++			state.mu.Lock()
++			writes, uploads := state.writes, len(state.uploads)
++			state.mu.Unlock()
++			downloadCount := downloads.Load()
++			applySyntheticFavoriteDelta(t, cli, mutation)
++			awaitFavoritePipeline(t, published, "repeated delta was not delivered")
++			state.mu.Lock()
++			defer state.mu.Unlock()
++			if state.writes != writes || len(state.uploads) != uploads || downloads.Load() != downloadCount {
++				t.Fatal("repeated recovered delta was not idempotent")
++			}
++			if !json.Valid(state.content["images"]) {
++				t.Fatal("retry published invalid account data")
++			}
++		})
++	}
++}
+diff --git a/pkg/connector/favorite_retry.go b/pkg/connector/favorite_retry.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c247f0454756f14b9f1542bf439999dcedc1052
+--- /dev/null
++++ b/pkg/connector/favorite_retry.go
+@@ -0,0 +1,273 @@
++package connector
++
++import (
++	"bytes"
++	"context"
++	"encoding/base64"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"time"
++
++	"go.mau.fi/whatsmeow"
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/proto/waE2E"
++	"go.mau.fi/whatsmeow/proto/waMmsRetry"
++	"go.mau.fi/whatsmeow/proto/waSyncAction"
++	"go.mau.fi/whatsmeow/types/events"
++	"google.golang.org/protobuf/proto"
++)
++
++// Política local conservadora: não repetir mídia expirada a cada lote/30s.
++// README.md documenta 1min dobrando até 1h; remova o estado ao desfavoritar.
++const favoriteStickerRetryInitial = time.Minute
++const favoriteStickerRetryMaximum = time.Hour
++
++type favoriteStickerRetry struct {
++	mutation  appstate.Mutation
++	delay     time.Duration
++	next      time.Time
++	requestID string
++	media     *waE2E.StickerMessage
++}
++
++type favoriteStickerRetryState struct {
++	pending    map[string]*favoriteStickerRetry
++	changes    map[string]appstate.Mutation
++	timer      *time.Timer
++	generation uint64
++	paused     bool
++	now        func() time.Time
++	afterFunc  func(time.Duration, func()) *time.Timer
++	download   favoriteStickerDownloader
++	request    func(context.Context, string, []byte) error
++	nextID     func() string
++}
++
++func (wa *WhatsAppClient) initFavoriteStickerRetries(ctx context.Context) {
++	if wa.favoriteStickerRetries != nil {
++		return
++	}
++	state := &favoriteStickerRetryState{pending: make(map[string]*favoriteStickerRetry), now: time.Now, afterFunc: time.AfterFunc,
++		download: func(ctx context.Context, msg *waE2E.StickerMessage) ([]byte, error) {
++			return wa.Client.Download(ctx, msg)
++		},
++		request: wa.requestFavoriteStickerReupload, nextID: func() string { return wa.Client.GenerateMessageID() },
++	}
++	wa.favoriteStickerRetries = state
++	context.AfterFunc(ctx, func() {
++		wa.Main.favoriteStickerLock.Lock(wa.UserLogin.User.MXID)
++		defer wa.Main.favoriteStickerLock.Unlock(wa.UserLogin.User.MXID)
++		if state.timer != nil {
++			state.timer.Stop()
++		}
++		state.generation++
++		clear(state.pending)
++	})
++}
++
++func (state *favoriteStickerRetryState) reconcile(prefix string, batch *events.FavoriteStickerSync) error {
++	changes := make(map[string]appstate.Mutation, len(batch.Mutations))
++	for _, mutation := range batch.Mutations {
++		change, err := favoriteStickerMutation(prefix, mutation)
++		if err != nil {
++			return err
++		}
++		changes[change.Key] = mutation
++	}
++	for key := range state.pending {
++		mutation, present := changes[key]
++		if !present {
++			if batch.FromFullSync {
++				delete(state.pending, key)
++			}
++			continue
++		}
++		change, _ := favoriteStickerMutation(prefix, mutation)
++		if change.Remove {
++			delete(state.pending, key)
++		} else {
++			if !proto.Equal(state.pending[key].mutation.Action.GetStickerAction(), mutation.Action.GetStickerAction()) {
++				state.pending[key].media = nil
++				state.pending[key].requestID = ""
++			}
++			state.pending[key].mutation = cloneFavoriteMutation(mutation)
++		}
++	}
++	state.changes = changes
++	return nil
++}
++
++func cloneFavoriteMutation(mutation appstate.Mutation) appstate.Mutation {
++	mutation.Index = append([]string(nil), mutation.Index...)
++	if mutation.Action != nil {
++		mutation.Action = proto.Clone(mutation.Action).(*waSyncAction.SyncActionValue)
++	}
++	return mutation
++}
++
++func (wa *WhatsAppClient) favoriteStickerDownload(ctx context.Context, succeeded map[string]bool) favoriteStickerDownloader {
++	state := wa.favoriteStickerRetries
++	prefix := favoriteStickerPrefix(string(wa.UserLogin.ID))
++	for key := range state.changes {
++		succeeded[key] = true
++	}
++	return func(_ context.Context, message *waE2E.StickerMessage) ([]byte, error) {
++		key := prefix + hex.EncodeToString(message.FileSHA256)
++		pending := state.pending[key]
++		if pending != nil && state.now().Before(pending.next) {
++			delete(succeeded, key)
++			return nil, ErrFavoriteStickerDownload
++		}
++		if pending != nil {
++			pending.next = state.now().Add(favoriteStickerRetryInitial)
++			if pending.media != nil {
++				message = pending.media
++			}
++		}
++		data, err := state.download(ctx, message)
++		if err == nil {
++			return data, nil
++		}
++		delete(succeeded, key)
++		if pending == nil {
++			pending = &favoriteStickerRetry{mutation: cloneFavoriteMutation(state.changes[key])}
++			state.pending[key] = pending
++		}
++		pending.delay = min(max(pending.delay*2, favoriteStickerRetryInitial), favoriteStickerRetryMaximum)
++		pending.next = state.now().Add(pending.delay)
++		pending.requestID = ""
++		// Nunca serializar Error() externo: URL, query e chaves podem estar nele.
++		log := wa.UserLogin.Log.Warn().Str("sticker", key).Dur("retry_in", pending.delay).Str("error_type", fmt.Sprintf("%T", err))
++		var httpErr whatsmeow.DownloadHTTPError
++		if errors.As(err, &httpErr) {
++			log.Int("status_code", httpErr.StatusCode)
++		}
++
++		if errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) || errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) || errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) {
++			pending.requestID = state.nextID()
++			requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
++			requestErr := state.request(requestCtx, pending.requestID, message.FileSHA256)
++			cancel()
++			if requestErr != nil {
++				pending.requestID = ""
++				log.Str("reupload", "unavailable")
++			} else {
++				log.Str("reupload", "requested")
++			}
++		}
++		log.Msg("Favorite sticker download deferred")
++		return nil, ErrFavoriteStickerDownload
++	}
++}
++
++func (wa *WhatsAppClient) scheduleFavoriteStickerRetries(ctx context.Context) {
++	state := wa.favoriteStickerRetries
++	if state.timer != nil {
++		state.timer.Stop()
++		state.timer = nil
++	}
++	state.generation++
++	generation := state.generation
++	if ctx.Err() != nil || state.paused || len(state.pending) == 0 {
++		return
++	}
++	var next time.Time
++	for _, pending := range state.pending {
++		if next.IsZero() || pending.next.Before(next) {
++			next = pending.next
++		}
++	}
++	state.timer = state.afterFunc(max(next.Sub(state.now()), 0), func() {
++		wa.Main.favoriteStickerLock.Lock(wa.UserLogin.User.MXID)
++		defer wa.Main.favoriteStickerLock.Unlock(wa.UserLogin.User.MXID)
++		if ctx.Err() != nil || state.paused || state.generation != generation {
++			return
++		}
++		batch := &events.FavoriteStickerSync{}
++		for _, pending := range state.pending {
++			if !state.now().Before(pending.next) {
++				batch.Mutations = append(batch.Mutations, cloneFavoriteMutation(pending.mutation))
++			}
++		}
++		success := wa.publishFavoriteStickerSync(ctx, batch)
++		if !success {
++			for _, pending := range state.pending {
++				if !state.now().Before(pending.next) {
++					pending.next = state.now().Add(favoriteStickerRetryInitial)
++				}
++			}
++			wa.scheduleFavoriteStickerRetries(ctx)
++		}
++	})
++}
++
++func (wa *WhatsAppClient) pauseFavoriteStickerRetries() {
++	wa.Main.favoriteStickerLock.Lock(wa.UserLogin.User.MXID)
++	defer wa.Main.favoriteStickerLock.Unlock(wa.UserLogin.User.MXID)
++	wa.initFavoriteStickerRetries(wa.Main.Bridge.BackgroundCtx)
++	state := wa.favoriteStickerRetries
++	state.paused = true
++	state.generation++
++	if state.timer != nil {
++		state.timer.Stop()
++		state.timer = nil
++	}
++}
++
++func (wa *WhatsAppClient) resumeFavoriteStickerRetries(ctx context.Context) {
++	wa.Main.favoriteStickerLock.Lock(wa.UserLogin.User.MXID)
++	defer wa.Main.favoriteStickerLock.Unlock(wa.UserLogin.User.MXID)
++	if state := wa.favoriteStickerRetries; state != nil {
++		state.paused = false
++		wa.scheduleFavoriteStickerRetries(ctx)
++	}
++}
++
++func favoriteStickerReuploadRequest(hash []byte) *waE2E.Message {
++	return &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
++		Type: waE2E.ProtocolMessage_PEER_DATA_OPERATION_REQUEST_MESSAGE.Enum(),
++		PeerDataOperationRequestMessage: &waE2E.PeerDataOperationRequestMessage{
++			PeerDataOperationRequestType: waE2E.PeerDataOperationRequestType_UPLOAD_STICKER.Enum(),
++			RequestStickerReupload:       []*waE2E.PeerDataOperationRequestMessage_RequestStickerReupload{{FileSHA256: proto.String(base64.StdEncoding.EncodeToString(hash))}},
++		},
++	}}
++}
++
++func (wa *WhatsAppClient) requestFavoriteStickerReupload(ctx context.Context, requestID string, hash []byte) error {
++	_, err := wa.Client.SendMessage(ctx, wa.JID.ToNonAD(), favoriteStickerReuploadRequest(hash), whatsmeow.SendRequestExtra{ID: requestID, Peer: true})
++	return err
++}
++
++func (wa *WhatsAppClient) handleFavoriteStickerReupload(ctx context.Context, evt *events.Message) bool {
++	response := evt.Message.GetProtocolMessage().GetPeerDataOperationRequestResponseMessage()
++	if evt.Message.GetProtocolMessage().GetType() != waE2E.ProtocolMessage_PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE || response == nil || response.PeerDataOperationRequestType == nil || response.GetPeerDataOperationRequestType() != waE2E.PeerDataOperationRequestType_UPLOAD_STICKER {
++		return false
++	}
++	if !evt.Info.IsFromMe || evt.Info.Sender.Device != 0 || (evt.Info.Sender.ToNonAD() != wa.JID.ToNonAD() && evt.Info.Sender.ToNonAD() != wa.LID.ToNonAD()) {
++		return true
++	}
++	wa.Main.favoriteStickerLock.Lock(wa.UserLogin.User.MXID)
++	defer wa.Main.favoriteStickerLock.Unlock(wa.UserLogin.User.MXID)
++	state := wa.favoriteStickerRetries
++	if state == nil || ctx.Err() != nil {
++		return true
++	}
++	for _, pending := range state.pending {
++		if pending.requestID == "" || pending.requestID != response.GetStanzaID() {
++			continue
++		}
++		change, _ := favoriteStickerMutation(favoriteStickerPrefix(string(wa.UserLogin.ID)), pending.mutation)
++		for _, result := range response.GetPeerDataOperationResult() {
++			message := result.GetStickerMessage()
++			if result.MediaUploadResult == nil || result.GetMediaUploadResult() != waMmsRetry.MediaRetryNotification_SUCCESS || message == nil || !bytes.Equal(message.FileSHA256, change.Hash) || message.GetDirectPath() == "" {
++				continue
++			}
++			pending.media = proto.Clone(message).(*waE2E.StickerMessage)
++			pending.requestID = ""
++			// Mantém a janela de backoff mesmo com respostas/replays imediatos.
++			break
++		}
++	}
++	return true
++}
+diff --git a/pkg/connector/favorite_retry_test.go b/pkg/connector/favorite_retry_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..60c3059b518146e12087fd93568911c1acd95572
+--- /dev/null
++++ b/pkg/connector/favorite_retry_test.go
+@@ -0,0 +1,337 @@
++package connector
++
++import (
++	"bytes"
++	"context"
++	"encoding/base64"
++	"encoding/json"
++	"fmt"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/rs/zerolog"
++	"go.mau.fi/whatsmeow"
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/proto/waE2E"
++	"go.mau.fi/whatsmeow/proto/waMmsRetry"
++	"go.mau.fi/whatsmeow/proto/waServerSync"
++	"go.mau.fi/whatsmeow/types"
++	"go.mau.fi/whatsmeow/types/events"
++	"google.golang.org/protobuf/proto"
++	"maunium.net/go/mautrix/appservice"
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/bridgev2/database"
++	"maunium.net/go/mautrix/bridgev2/matrix"
++)
++
++type favoriteRetryFixture struct {
++	wa        *WhatsAppClient
++	matrix    *syntheticFavoriteServer
++	now       time.Time
++	fire      func()
++	delay     time.Duration
++	logs      bytes.Buffer
++	requests  int
++	requestID string
++}
++
++func newFavoriteRetryFixture(t *testing.T, download favoriteStickerDownloader) *favoriteRetryFixture {
++	t.Helper()
++	state, client := newSyntheticFavoriteServer(t)
++	fixture := &favoriteRetryFixture{matrix: state, now: time.Unix(1000, 0)}
++	logger := zerolog.New(&fixture.logs).Level(zerolog.WarnLevel)
++	service, err := appservice.CreateFull(appservice.CreateOpts{Registration: &appservice.Registration{SenderLocalpart: "synthetic-bot"}, HomeserverDomain: "example.invalid", HomeserverURL: client.HomeserverURL.String()})
++	if err != nil {
++		t.Fatal(err)
++	}
++	service.DoublePuppetValue = "synthetic-whatsapp"
++	puppet := service.NewIntentAPI("synthetic")
++	puppet.Client = client
++	puppet.IsCustomPuppet = true
++	ctx, cancel := context.WithCancel(context.Background())
++	t.Cleanup(cancel)
++	bridge := &bridgev2.Bridge{BackgroundCtx: ctx, Matrix: &syntheticFavoriteMatrix{intent: &matrix.ASIntent{Matrix: puppet}}}
++	login := &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "synthetic-login"}, Log: logger}
++	login.User = &bridgev2.User{User: &database.User{MXID: client.UserID, AccessToken: "synthetic-token"}, Bridge: bridge, Log: logger}
++	fixture.wa = &WhatsAppClient{Main: &WhatsAppConnector{Bridge: bridge}, UserLogin: login, MC: noopMCInstance, JID: types.NewJID("123", types.DefaultUserServer)}
++	fixture.wa.favoriteStickerRetries = &favoriteStickerRetryState{
++		pending: make(map[string]*favoriteStickerRetry), now: func() time.Time { return fixture.now },
++		afterFunc: func(delay time.Duration, fire func()) *time.Timer {
++			fixture.delay = delay
++			fixture.fire = fire
++			return nil
++		},
++		download: download, nextID: func() string { return fmt.Sprintf("synthetic-request-%d", fixture.requests+1) },
++		request: func(_ context.Context, id string, hash []byte) error {
++			fixture.requests++
++			fixture.requestID = id
++			if len(hash) != 32 {
++				t.Fatal("reupload lost content hash")
++			}
++			return nil
++		},
++	}
++	return fixture
++}
++
++func (fixture *favoriteRetryFixture) advance(t *testing.T) {
++	t.Helper()
++	if fixture.fire == nil {
++		t.Fatal("no media retry scheduled")
++	}
++	fire := fixture.fire
++	fixture.fire = nil
++	fixture.now = fixture.now.Add(fixture.delay)
++	fire()
++}
++
++func TestFavoriteRetryBackoffAndRecovery(t *testing.T) {
++	bad, good1, good2 := []byte("synthetic expired"), []byte("synthetic good 1"), []byte("synthetic good 2")
++	attempts := 0
++	recovered := false
++	fixture := newFavoriteRetryFixture(t, func(_ context.Context, msg *waE2E.StickerMessage) ([]byte, error) {
++		if bytes.Equal(msg.FileSHA256, sha256Bytes(bad)) {
++			attempts++
++			if !recovered {
++				return nil, whatsmeow.ErrMediaDownloadFailedWith403
++			}
++			return bad, nil
++		}
++		if bytes.Equal(msg.FileSHA256, sha256Bytes(good1)) {
++			return good1, nil
++		}
++		return good2, nil
++	})
++	batch := &events.FavoriteStickerSync{FromFullSync: true, Mutations: []appstate.Mutation{syntheticFavorite(bad, false), syntheticFavorite(good1, false), syntheticFavorite(good2, false)}}
++	if !fixture.wa.handleWAEvent(batch) || !fixture.wa.favoriteStickerSnapshotSeen.Load() {
++		t.Fatal("partial publication was not acknowledged")
++	}
++	if len(syntheticImages(t, fixture.matrix)) != 3 || fixture.delay != time.Minute || attempts != 1 || fixture.requests != 1 {
++		t.Fatal("incorrect first partial publication/backoff")
++	}
++	for step := 0; step < 7; step++ {
++		before := fixture.logs.String()
++		if !fixture.wa.handleWAEvent(batch) || attempts != step+1 || fixture.logs.String() != before {
++			t.Fatalf("ordinary sync retried or logged deferred media: step=%d attempts=%d before=%s after=%s", step, attempts, before, fixture.logs.String())
++		}
++		expected := min(time.Minute*time.Duration(1<<step), time.Hour)
++		if fixture.delay != expected {
++			t.Fatalf("step %d delay=%s expected=%s", step, fixture.delay, expected)
++		}
++		fixture.advance(t)
++		if attempts != step+2 || strings.Count(fixture.logs.String(), "Favorite sticker download deferred") != attempts || fixture.requests != attempts {
++			t.Fatal("failure was not logged/requested once per due attempt")
++		}
++	}
++	if fixture.delay != time.Hour {
++		t.Fatal("backoff did not cap")
++	}
++	recovered = true
++	fixture.advance(t)
++	if len(syntheticImages(t, fixture.matrix)) != 4 || len(fixture.wa.favoriteStickerRetries.pending) != 0 || fixture.fire != nil {
++		t.Fatal("media did not publish after recovery, or timer persisted")
++	}
++	if strings.Contains(fixture.logs.String(), "Failed to publish favorite stickers") {
++		t.Fatal("download failure leaked into whole-batch retry")
++	}
++}
++
++func TestFavoriteRetryRemoveAndSnapshotWin(t *testing.T) {
++	for _, scenario := range []string{"remove", "set_false", "empty_snapshot", "replacement_snapshot"} {
++		t.Run(scenario, func(t *testing.T) {
++			attempts := 0
++			fixture := newFavoriteRetryFixture(t, func(context.Context, *waE2E.StickerMessage) ([]byte, error) {
++				attempts++
++				return nil, whatsmeow.ErrMediaDownloadFailedWith403
++			})
++			mutation := syntheticFavorite([]byte("synthetic expired"), false)
++			if !fixture.wa.handleWAEvent(&events.FavoriteStickerSync{Mutations: []appstate.Mutation{mutation}}) {
++				t.Fatal("initial deferred batch failed")
++			}
++			stale := fixture.fire
++			batch := &events.FavoriteStickerSync{}
++			switch scenario {
++			case "remove":
++				mutation.Operation = waServerSync.SyncdMutation_REMOVE
++				mutation.Action = nil
++				batch.Mutations = []appstate.Mutation{mutation}
++			case "set_false":
++				mutation = cloneFavoriteMutation(mutation)
++				mutation.Action.StickerAction.IsFavorite = proto.Bool(false)
++				batch.Mutations = []appstate.Mutation{mutation}
++			case "empty_snapshot":
++				batch.FromFullSync = true
++			case "replacement_snapshot":
++				batch.FromFullSync = true
++				data := []byte("replacement synthetic")
++				batch.Mutations = []appstate.Mutation{syntheticFavorite(data, false)}
++				fixture.wa.favoriteStickerRetries.download = func(context.Context, *waE2E.StickerMessage) ([]byte, error) { attempts++; return data, nil }
++			}
++			if !fixture.wa.handleWAEvent(batch) {
++				t.Fatal("newer state failed")
++			}
++			before := attempts
++			stale()
++			if attempts != before || len(fixture.wa.favoriteStickerRetries.pending) != 0 {
++				t.Fatal("stale retry resurrected removed favorite")
++			}
++			expected := 1
++			if scenario == "replacement_snapshot" {
++				expected = 2
++			}
++			if len(syntheticImages(t, fixture.matrix)) != expected {
++				t.Fatal("snapshot/remove lost foreign or retained expired favorite")
++			}
++		})
++	}
++}
++
++func TestFavoriteRetryMatrixFailureDoesNotLoseMedia(t *testing.T) {
++	for _, scenario := range []string{"read", "upload", "put"} {
++		t.Run(scenario, func(t *testing.T) {
++			data := []byte("synthetic recovered")
++			attempts := 0
++			fixture := newFavoriteRetryFixture(t, func(context.Context, *waE2E.StickerMessage) ([]byte, error) {
++				attempts++
++				if attempts == 1 {
++					return nil, whatsmeow.ErrMediaDownloadFailedWith403
++				}
++				return data, nil
++			})
++			mutation := syntheticFavorite(data, false)
++			if !fixture.wa.handleWAEvent(&events.FavoriteStickerSync{Mutations: []appstate.Mutation{mutation}}) {
++				t.Fatal("initial defer failed")
++			}
++			fixture.matrix.mu.Lock()
++			switch scenario {
++			case "read":
++				fixture.matrix.readError = 403
++			case "upload":
++				fixture.matrix.uploadError = 403
++			case "put":
++				fixture.matrix.writeError = 403
++			}
++			fixture.matrix.mu.Unlock()
++			fixture.advance(t)
++			if len(syntheticImages(t, fixture.matrix)) != 1 || len(fixture.wa.favoriteStickerRetries.pending) != 1 || fixture.delay <= 0 {
++				t.Fatal("Matrix failure dropped pending media or spun")
++			}
++			fixture.matrix.mu.Lock()
++			fixture.matrix.readError = 0
++			fixture.matrix.uploadError = 0
++			fixture.matrix.writeError = 0
++			fixture.matrix.mu.Unlock()
++			fixture.advance(t)
++			if len(syntheticImages(t, fixture.matrix)) != 2 || len(fixture.wa.favoriteStickerRetries.pending) != 0 {
++				t.Fatal("failed Matrix effect lost recovered favorite")
++			}
++		})
++	}
++}
++
++func syntheticFavoriteReupload(fixture *favoriteRetryFixture, data []byte) *events.Message {
++	return &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{IsFromMe: true, Sender: fixture.wa.JID}}, Message: &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
++		Type: waE2E.ProtocolMessage_PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE.Enum(), PeerDataOperationRequestResponseMessage: &waE2E.PeerDataOperationRequestResponseMessage{
++			PeerDataOperationRequestType: waE2E.PeerDataOperationRequestType_UPLOAD_STICKER.Enum(), StanzaID: proto.String(fixture.requestID),
++			PeerDataOperationResult: []*waE2E.PeerDataOperationRequestResponseMessage_PeerDataOperationResult{{MediaUploadResult: waMmsRetry.MediaRetryNotification_SUCCESS.Enum(), StickerMessage: &waE2E.StickerMessage{FileSHA256: sha256Bytes(data), DirectPath: proto.String("/synthetic-refreshed"), MediaKey: bytes.Repeat([]byte{3}, 32), FileEncSHA256: bytes.Repeat([]byte{4}, 32)}}},
++		}}}}
++}
++
++func TestFavoritePeerReuploadRefreshAndLateResponse(t *testing.T) {
++	for _, scenario := range []string{"valid", "wrong_id", "wrong_hash", "foreign_sender", "not_from_me", "companion_sender", "failure", "missing_result", "remove_before_response", "remove_after_response"} {
++		t.Run(scenario, func(t *testing.T) {
++			data := []byte("synthetic refresh")
++			attempts := 0
++			fixture := newFavoriteRetryFixture(t, func(_ context.Context, msg *waE2E.StickerMessage) ([]byte, error) {
++				attempts++
++				if msg.GetDirectPath() != "/synthetic-refreshed" {
++					return nil, whatsmeow.ErrMediaDownloadFailedWith403
++				}
++				if !bytes.Equal(msg.MediaKey, bytes.Repeat([]byte{3}, 32)) || !bytes.Equal(msg.FileEncSHA256, bytes.Repeat([]byte{4}, 32)) {
++					t.Fatal("refresh lost encryption details")
++				}
++				return data, nil
++			})
++			mutation := syntheticFavorite(data, false)
++			batch := &events.FavoriteStickerSync{Mutations: []appstate.Mutation{mutation}}
++			if !fixture.wa.handleWAEvent(batch) {
++				t.Fatal("initial defer failed")
++			}
++			request := favoriteStickerReuploadRequest(sha256Bytes(data)).ProtocolMessage.PeerDataOperationRequestMessage
++			if request.GetPeerDataOperationRequestType() != waE2E.PeerDataOperationRequestType_UPLOAD_STICKER || request.RequestStickerReupload[0].GetFileSHA256() != base64.StdEncoding.EncodeToString(sha256Bytes(data)) {
++				t.Fatal("invalid native reupload request")
++			}
++			evt := syntheticFavoriteReupload(fixture, data)
++			response := evt.Message.ProtocolMessage.PeerDataOperationRequestResponseMessage
++			remove := func() {
++				mutation.Operation = waServerSync.SyncdMutation_REMOVE
++				mutation.Action = nil
++				if !fixture.wa.handleWAEvent(&events.FavoriteStickerSync{Mutations: []appstate.Mutation{mutation}}) {
++					t.Fatal("remove failed")
++				}
++			}
++			switch scenario {
++			case "wrong_id":
++				response.StanzaID = proto.String("other")
++			case "wrong_hash":
++				response.PeerDataOperationResult[0].StickerMessage.FileSHA256 = sha256Bytes([]byte("other"))
++			case "foreign_sender":
++				evt.Info.Sender = types.NewJID("999", types.DefaultUserServer)
++			case "not_from_me":
++				evt.Info.IsFromMe = false
++			case "companion_sender":
++				evt.Info.Sender.Device = 4
++			case "failure":
++				response.PeerDataOperationResult[0].MediaUploadResult = waMmsRetry.MediaRetryNotification_NOT_FOUND.Enum()
++			case "missing_result":
++				response.PeerDataOperationResult[0].MediaUploadResult = nil
++			case "remove_before_response":
++				remove()
++			}
++			stale := fixture.fire
++			if !fixture.wa.handleWAEvent(evt) {
++				t.Fatal("peer response not consumed")
++			}
++			if scenario == "remove_after_response" {
++				remove()
++			}
++			if strings.HasPrefix(scenario, "remove_") {
++				stale()
++				if len(syntheticImages(t, fixture.matrix)) != 1 {
++					t.Fatal("late response resurrected favorite")
++				}
++				return
++			}
++			if !fixture.wa.handleWAEvent(batch) || attempts != 1 {
++				t.Fatal("response bypassed backoff")
++			}
++			fixture.advance(t)
++			expected := 1
++			if scenario == "valid" {
++				expected = 2
++			}
++			if len(syntheticImages(t, fixture.matrix)) != expected {
++				t.Fatal("refresh result accepted incorrectly")
++			}
++		})
++	}
++}
++
++func TestFavoriteRetryLogRedactsExternalError(t *testing.T) {
++	const secret = "SYNTHETIC_PRIVATE_URL_AND_KEY"
++	fixture := newFavoriteRetryFixture(t, func(context.Context, *waE2E.StickerMessage) ([]byte, error) {
++		return nil, fmt.Errorf("%s: %w", secret, whatsmeow.ErrMediaDownloadFailedWith403)
++	})
++	fixture.wa.favoriteStickerRetries.request = func(context.Context, string, []byte) error { return fmt.Errorf("%s", secret) }
++	if !fixture.wa.handleWAEvent(&events.FavoriteStickerSync{Mutations: []appstate.Mutation{syntheticFavorite([]byte("synthetic"), false)}}) {
++		t.Fatal("deferred batch failed")
++	}
++	if strings.Contains(fixture.logs.String(), secret) || strings.Count(fixture.logs.String(), "Favorite sticker download deferred") != 1 {
++		t.Fatal("secret leaked or failure logged more than once")
++	}
++	var log map[string]json.RawMessage
++	if json.Unmarshal(bytes.TrimSpace(fixture.logs.Bytes()), &log) != nil || log["reupload"] == nil {
++		t.Fatalf("safe diagnostic missing: %s", fixture.logs.String())
++	}
++}
+diff --git a/pkg/connector/favorite_stickers.go b/pkg/connector/favorite_stickers.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa2a0c1ae0a363de025da1adb47f5f48e9c83d5c
+--- /dev/null
++++ b/pkg/connector/favorite_stickers.go
+@@ -0,0 +1,336 @@
++package connector
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"maps"
++	"strings"
++
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/proto/waE2E"
++	"go.mau.fi/whatsmeow/proto/waServerSync"
++	"go.mau.fi/whatsmeow/proto/waSyncAction"
++	"go.mau.fi/whatsmeow/types/events"
++	"maunium.net/go/mautrix"
++	"maunium.net/go/mautrix/bridgev2/matrix"
++	"maunium.net/go/mautrix/id"
++
++	"go.mau.fi/mautrix-whatsapp/pkg/msgconv"
++)
++
++const favoriteStickerAccountData = "im.ponies.user_emotes"
++const favoriteStickerMetadata = "fi.mau.whatsapp.favorite"
++
++var ErrFavoriteStickerData = errors.New("invalid favorite sticker data")
++var ErrFavoriteStickerPuppet = errors.New("favorite stickers require a double puppet")
++var ErrFavoriteStickerDownload = errors.New("favorite sticker media pending retry")
++
++type favoriteStickerChange struct {
++	Key       string
++	Hash      []byte
++	Action    *waSyncAction.StickerAction
++	Timestamp int64
++	Remove    bool
++}
++
++type favoriteStickerMedia struct {
++	Data      []byte
++	MimeType  string
++	Name      string
++	Animation []byte
++}
++
++func favoriteStickerPrefix(loginID string) string {
++	sum := sha256.Sum256([]byte(loginID))
++	return "whatsapp_" + hex.EncodeToString(sum[:8]) + "_"
++}
++
++func favoriteStickerMutation(prefix string, mutation appstate.Mutation) (favoriteStickerChange, error) {
++	if len(mutation.Index) != 2 || mutation.Index[0] != appstate.IndexFavoriteSticker {
++		return favoriteStickerChange{}, fmt.Errorf("%w: unexpected index", ErrFavoriteStickerData)
++	}
++	hash, err := base64.StdEncoding.DecodeString(mutation.Index[1])
++	if err != nil || len(hash) != sha256.Size {
++		return favoriteStickerChange{}, fmt.Errorf("%w: invalid file hash", ErrFavoriteStickerData)
++	}
++	change := favoriteStickerChange{Key: prefix + hex.EncodeToString(hash), Hash: hash, Action: mutation.Action.GetStickerAction(), Timestamp: mutation.Action.GetTimestamp()}
++	switch mutation.Operation {
++	case waServerSync.SyncdMutation_REMOVE:
++		change.Remove = true
++	case waServerSync.SyncdMutation_SET:
++		if change.Action == nil {
++			return favoriteStickerChange{}, fmt.Errorf("%w: missing StickerAction", ErrFavoriteStickerData)
++		}
++		change.Remove = !change.Action.GetIsFavorite() || change.Action.GetIsAvatarSticker()
++	default:
++		return favoriteStickerChange{}, fmt.Errorf("%w: unsupported operation", ErrFavoriteStickerData)
++	}
++	return change, nil
++}
++
++func prepareFavoriteSticker(change favoriteStickerChange, data []byte) (favoriteStickerMedia, error) {
++	sum := sha256.Sum256(data)
++	if !bytes.Equal(sum[:], change.Hash) {
++		return favoriteStickerMedia{}, fmt.Errorf("%w: downloaded hash mismatch", ErrFavoriteStickerData)
++	}
++	media := favoriteStickerMedia{Data: data, MimeType: change.Action.GetMimetype(), Name: "sticker.webp"}
++	if change.Action.GetIsLottie() {
++		animation, _, err := msgconv.ExtractAnimatedSticker(data)
++		if err != nil {
++			return favoriteStickerMedia{}, fmt.Errorf("%w: %v", ErrFavoriteStickerData, err)
++		}
++		if !json.Valid(animation) {
++			return favoriteStickerMedia{}, fmt.Errorf("%w: invalid Lottie JSON", ErrFavoriteStickerData)
++		}
++		media.MimeType = "application/was"
++		media.Name = "sticker.was"
++		media.Animation = animation
++	} else if media.MimeType == "" {
++		media.MimeType = "image/webp"
++	}
++	return media, nil
++}
++
++func favoriteStickerEntry(change favoriteStickerChange, media favoriteStickerMedia, original, animation id.ContentURIString) json.RawMessage {
++	info := map[string]any{"mimetype": media.MimeType, "size": len(media.Data), "w": change.Action.GetWidth(), "h": change.Action.GetHeight()}
++	metadata := map[string]any{"file_sha256": hex.EncodeToString(change.Hash), "timestamp": change.Timestamp}
++	if len(media.Animation) > 0 {
++		metadata["animation_url"] = animation
++		metadata["animation_info"] = map[string]any{"mimetype": "video/lottie+json", "size": len(media.Animation), "w": change.Action.GetWidth(), "h": change.Action.GetHeight()}
++	}
++	entry, _ := json.Marshal(map[string]any{"url": original, "body": "WhatsApp sticker", "info": info, "usage": []string{"sticker"}, favoriteStickerMetadata: metadata})
++	return entry
++}
++
++func ownedFavoriteSticker(prefix, key string, entry json.RawMessage) bool {
++	if !strings.HasPrefix(key, prefix) {
++		return false
++	}
++	var value map[string]json.RawMessage
++	if json.Unmarshal(entry, &value) != nil {
++		return false
++	}
++	var metadata struct {
++		Hash string `json:"file_sha256"`
++	}
++	return json.Unmarshal(value[favoriteStickerMetadata], &metadata) == nil && len(metadata.Hash) == 64 && key == prefix+metadata.Hash
++}
++
++type favoriteStickerPack struct {
++	Fields map[string]json.RawMessage
++	Images map[string]json.RawMessage
++}
++
++func readFavoriteStickerPack(ctx context.Context, client *mautrix.Client) (favoriteStickerPack, error) {
++	var fields map[string]json.RawMessage
++	err := client.GetAccountData(ctx, favoriteStickerAccountData, &fields)
++	if err != nil && !errors.Is(err, mautrix.MNotFound) {
++		return favoriteStickerPack{}, fmt.Errorf("read favorite sticker account data: %w", err)
++	}
++	if fields == nil {
++		fields = make(map[string]json.RawMessage)
++	}
++	images := make(map[string]json.RawMessage)
++	if raw, exists := fields["images"]; exists {
++		if string(raw) == "null" {
++			return favoriteStickerPack{}, fmt.Errorf("%w: images is null", ErrFavoriteStickerData)
++		}
++		if err = json.Unmarshal(raw, &images); err != nil {
++			return favoriteStickerPack{}, fmt.Errorf("%w: images: %v", ErrFavoriteStickerData, err)
++		}
++	}
++	return favoriteStickerPack{Fields: fields, Images: images}, nil
++}
++
++func mergeFavoriteStickerPack(current favoriteStickerPack, prefix string, changes map[string]json.RawMessage, fullSync bool) (map[string]json.RawMessage, error) {
++	fields := maps.Clone(current.Fields)
++	images := maps.Clone(current.Images)
++	for key, entry := range images {
++		if ownedFavoriteSticker(prefix, key, entry) {
++			if _, exists := changes[key]; fullSync && !exists {
++				delete(images, key)
++			}
++		}
++	}
++	for key, entry := range changes {
++		if previous, exists := images[key]; exists && !ownedFavoriteSticker(prefix, key, previous) {
++			return nil, fmt.Errorf("%w: shortcode collision", ErrFavoriteStickerData)
++		}
++		if entry == nil {
++			delete(images, key)
++		} else {
++			images[key] = entry
++		}
++	}
++	var pack map[string]json.RawMessage
++	if raw, exists := fields["pack"]; exists {
++		if err := json.Unmarshal(raw, &pack); err != nil || pack == nil {
++			return nil, fmt.Errorf("%w: malformed pack", ErrFavoriteStickerData)
++		}
++	} else {
++		pack = make(map[string]json.RawMessage)
++	}
++	if _, exists := pack["display_name"]; !exists {
++		pack["display_name"] = json.RawMessage(`"WhatsApp"`)
++	}
++	if _, exists := pack["usage"]; !exists && len(current.Images) == 0 {
++		pack["usage"] = json.RawMessage(`["sticker"]`)
++	}
++	fields["pack"], _ = json.Marshal(pack)
++	fields["images"], _ = json.Marshal(images)
++	return fields, nil
++}
++
++type favoriteStickerDownloader func(context.Context, *waE2E.StickerMessage) ([]byte, error)
++
++func syncFavoriteStickers(ctx context.Context, client *mautrix.Client, prefix string, batch *events.FavoriteStickerSync, download favoriteStickerDownloader) error {
++	changes := make(map[string]favoriteStickerChange, len(batch.Mutations))
++	order := make([]string, 0, len(batch.Mutations))
++	for _, mutation := range batch.Mutations {
++		change, err := favoriteStickerMutation(prefix, mutation)
++		if err != nil {
++			return err
++		}
++		if _, exists := changes[change.Key]; !exists {
++			order = append(order, change.Key)
++		}
++		changes[change.Key] = change
++	}
++	current, err := readFavoriteStickerPack(ctx, client)
++	if err != nil {
++		return err
++	}
++	if _, err = mergeFavoriteStickerPack(current, prefix, nil, false); err != nil {
++		return err
++	}
++	for key := range changes {
++		if previous, exists := current.Images[key]; exists && !ownedFavoriteSticker(prefix, key, previous) {
++			return fmt.Errorf("%w: shortcode collision", ErrFavoriteStickerData)
++		}
++	}
++	entries := make(map[string]json.RawMessage, len(changes))
++	var mediaErr error
++	for _, key := range order {
++		change := changes[key]
++		if change.Remove {
++			entries[key] = nil
++			continue
++		}
++		if previous, exists := current.Images[key]; exists && ownedFavoriteSticker(prefix, key, previous) {
++			var entry map[string]json.RawMessage
++			var metadata map[string]json.RawMessage
++			_ = json.Unmarshal(previous, &entry)
++			_ = json.Unmarshal(entry[favoriteStickerMetadata], &metadata)
++			metadata["timestamp"], _ = json.Marshal(change.Timestamp)
++			entry[favoriteStickerMetadata], _ = json.Marshal(metadata)
++			entries[key], _ = json.Marshal(entry)
++			continue
++		}
++		action := change.Action
++		data, downloadErr := download(ctx, &waE2E.StickerMessage{URL: action.URL, DirectPath: action.DirectPath, MediaKey: action.MediaKey, FileSHA256: change.Hash, FileEncSHA256: action.FileEncSHA256, FileLength: action.FileLength, Mimetype: action.Mimetype})
++		if downloadErr != nil {
++			if ctx.Err() != nil {
++				return ctx.Err()
++			}
++			mediaErr = ErrFavoriteStickerDownload
++			continue
++		}
++		media, prepareErr := prepareFavoriteSticker(change, data)
++		if prepareErr != nil {
++			return prepareErr
++		}
++		original, uploadErr := client.UploadBytesWithName(ctx, media.Data, media.MimeType, media.Name)
++		if uploadErr != nil {
++			return fmt.Errorf("upload favorite sticker: %w", uploadErr)
++		}
++		var animation id.ContentURIString
++		if len(media.Animation) > 0 {
++			uploaded, animationErr := client.UploadBytesWithName(ctx, media.Animation, "video/lottie+json", "sticker.json")
++			if animationErr != nil {
++				return fmt.Errorf("upload favorite animation: %w", animationErr)
++			}
++			animation = uploaded.ContentURI.CUString()
++		}
++		entries[key] = favoriteStickerEntry(change, media, original.ContentURI.CUString(), animation)
++	}
++	if len(entries) == 0 && !batch.FromFullSync {
++		return mediaErr
++	}
++	current, err = readFavoriteStickerPack(ctx, client)
++	if err != nil {
++		return err
++	}
++	merged, err := mergeFavoriteStickerPack(current, prefix, entries, batch.FromFullSync)
++	if err != nil {
++		return err
++	}
++	before, _ := json.Marshal(current.Fields)
++	after, _ := json.Marshal(merged)
++	if string(before) == string(after) {
++		return mediaErr
++	}
++	if err = client.SetAccountData(ctx, favoriteStickerAccountData, merged); err != nil {
++		return fmt.Errorf("publish favorite sticker pack: %w", err)
++	}
++	return mediaErr
++}
++
++func (wa *WhatsAppClient) handleFavoriteStickerSync(ctx context.Context, batch *events.FavoriteStickerSync) bool {
++	wa.Main.favoriteStickerLock.Lock(wa.UserLogin.User.MXID)
++	defer wa.Main.favoriteStickerLock.Unlock(wa.UserLogin.User.MXID)
++	return wa.publishFavoriteStickerSync(ctx, batch)
++}
++
++func (wa *WhatsAppClient) publishFavoriteStickerSync(ctx context.Context, batch *events.FavoriteStickerSync) bool {
++	if ctx.Err() != nil {
++		return false
++	}
++	wa.initFavoriteStickerRetries(ctx)
++	if wa.favoriteStickerRetries.paused {
++		return false
++	}
++	if err := wa.favoriteStickerRetries.reconcile(favoriteStickerPrefix(string(wa.UserLogin.ID)), batch); err != nil {
++		wa.UserLogin.Log.Err(err).Msg("Invalid favorite sticker batch")
++		return false
++	}
++	defer func() { wa.favoriteStickerRetries.changes = nil }()
++	defer wa.scheduleFavoriteStickerRetries(ctx)
++	puppet, ok := wa.UserLogin.User.DoublePuppet(ctx).(*matrix.ASIntent)
++	if !ok || !puppet.IsDoublePuppet() {
++		wa.UserLogin.Log.Error().Err(ErrFavoriteStickerPuppet).Msg("Cannot publish favorite stickers")
++		return false
++	}
++	succeeded := make(map[string]bool)
++	err := syncFavoriteStickers(ctx, puppet.Matrix.Client, favoriteStickerPrefix(string(wa.UserLogin.ID)), batch, wa.favoriteStickerDownload(ctx, succeeded))
++	if err != nil && !errors.Is(err, ErrFavoriteStickerDownload) {
++		wa.UserLogin.Log.Err(err).Msg("Failed to publish favorite stickers")
++		return false
++	}
++	for key := range succeeded {
++		delete(wa.favoriteStickerRetries.pending, key)
++	}
++	if batch.FromFullSync {
++		wa.favoriteStickerSnapshotSeen.Store(true)
++	}
++	return true
++}
++
++func (wa *WhatsAppClient) ensureFavoriteStickerSnapshot(ctx context.Context) {
++	if !wa.favoriteStickerSnapshotRequested.CompareAndSwap(false, true) || wa.favoriteStickerSnapshotSeen.Load() {
++		return
++	}
++	go func() {
++		if err := wa.Client.FetchAppState(ctx, appstate.WAPatchRegularLow, true, false); err != nil {
++			wa.favoriteStickerSnapshotRequested.Store(false)
++			wa.UserLogin.Log.Err(err).Msg("Failed to fetch initial favorite sticker snapshot")
++		} else if !wa.favoriteStickerSnapshotSeen.Load() {
++			wa.favoriteStickerSnapshotRequested.Store(false)
++		}
++	}()
++}
+diff --git a/pkg/connector/favorite_stickers_test.go b/pkg/connector/favorite_stickers_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..e046917ba66c26893f4db98789bcde87283f94b0
+--- /dev/null
++++ b/pkg/connector/favorite_stickers_test.go
+@@ -0,0 +1,420 @@
++package connector
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/rs/zerolog"
++
++	"go.mau.fi/mautrix-whatsapp/pkg/msgconv"
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/proto/waE2E"
++	"go.mau.fi/whatsmeow/proto/waServerSync"
++	"go.mau.fi/whatsmeow/proto/waSyncAction"
++	"go.mau.fi/whatsmeow/types/events"
++	"google.golang.org/protobuf/proto"
++	"maunium.net/go/mautrix"
++	"maunium.net/go/mautrix/appservice"
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/bridgev2/database"
++	"maunium.net/go/mautrix/bridgev2/matrix"
++	"maunium.net/go/mautrix/id"
++)
++
++type syntheticFavoriteMatrix struct {
++	bridgev2.MatrixConnector
++	intent bridgev2.MatrixAPI
++}
++
++func (connector *syntheticFavoriteMatrix) NewUserIntent(_ context.Context, _ id.UserID, token string) (bridgev2.MatrixAPI, string, error) {
++	return connector.intent, token, nil
++}
++
++func TestFavoriteStickerEventUsesDoublePuppet(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		state, client := newSyntheticFavoriteServer(t)
++		var intent bridgev2.MatrixAPI
++		if enabled {
++			service, err := appservice.CreateFull(appservice.CreateOpts{Registration: &appservice.Registration{SenderLocalpart: "synthetic-bot"}, HomeserverDomain: "example.invalid", HomeserverURL: client.HomeserverURL.String()})
++			if err != nil {
++				t.Fatal(err)
++			}
++			service.DoublePuppetValue = "synthetic-whatsapp"
++			puppet := service.NewIntentAPI("synthetic")
++			puppet.Client = client
++			puppet.IsCustomPuppet = true
++			intent = &matrix.ASIntent{Matrix: puppet}
++		}
++		bridge := &bridgev2.Bridge{BackgroundCtx: context.Background(), Matrix: &syntheticFavoriteMatrix{intent: intent}}
++		login := &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "synthetic-login"}, Log: zerolog.Nop()}
++		login.User = &bridgev2.User{User: &database.User{MXID: client.UserID, AccessToken: "synthetic-token"}, Bridge: bridge, Log: zerolog.Nop()}
++		wa := &WhatsAppClient{Main: &WhatsAppConnector{Bridge: bridge}, UserLogin: login, MC: noopMCInstance}
++		data := []byte("synthetic")
++		mutation := syntheticFavorite(data, false)
++		change, _ := favoriteStickerMutation(favoriteStickerPrefix("synthetic-login"), mutation)
++		entry := favoriteStickerEntry(change, favoriteStickerMedia{Data: data, MimeType: "image/webp"}, "mxc://synthetic/owned", "")
++		state.content["images"], _ = json.Marshal(map[string]json.RawMessage{change.Key: entry, "foreign": json.RawMessage(`{"url":"mxc://synthetic/foreign"}`)})
++		mutation.Operation = waServerSync.SyncdMutation_REMOVE
++		mutation.Action = nil
++		success := wa.handleWAEvent(&events.FavoriteStickerSync{Mutations: []appstate.Mutation{mutation}, FromFullSync: true})
++		if success != enabled {
++			t.Fatalf("enabled=%v success=%v", enabled, success)
++		}
++		if enabled {
++			if state.writes != 1 || len(syntheticImages(t, state)) != 1 || !wa.favoriteStickerSnapshotSeen.Load() {
++				t.Fatal("event did not publish as double puppet")
++			}
++		} else if state.writes != 0 || len(state.uploads) != 0 {
++			t.Fatal("missing double puppet caused an effect")
++		}
++	}
++}
++
++type syntheticFavoriteServer struct {
++	mu            sync.Mutex
++	content       map[string]json.RawMessage
++	writes        int
++	uploads       [][]byte
++	mimes         []string
++	readError     int
++	writeError    int
++	uploadError   int
++	uploadCalls   int
++	uploadErrorAt int
++	onUpload      func(map[string]json.RawMessage)
++}
++
++func newSyntheticFavoriteServer(t *testing.T) (*syntheticFavoriteServer, *mautrix.Client) {
++	t.Helper()
++	state := &syntheticFavoriteServer{content: map[string]json.RawMessage{"images": json.RawMessage(`{"other_client":{"url":"mxc://synthetic/other","custom":true}}`), "custom": json.RawMessage(`{"preserved":true}`)}}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		state.mu.Lock()
++		defer state.mu.Unlock()
++		w.Header().Set("Content-Type", "application/json")
++		if r.Header.Get("Authorization") != "Bearer synthetic-token" {
++			t.Error("wrong double puppet identity")
++		}
++		if strings.Contains(r.URL.Path, "/upload") {
++			state.uploadCalls++
++			if state.uploadError != 0 && (state.uploadErrorAt == 0 || state.uploadCalls == state.uploadErrorAt) {
++				w.WriteHeader(state.uploadError)
++				_, _ = io.WriteString(w, `{"errcode":"M_UNKNOWN","error":"synthetic"}`)
++				return
++			}
++			data, err := io.ReadAll(r.Body)
++			if err != nil {
++				t.Error(err)
++			}
++			state.uploads = append(state.uploads, data)
++			state.mimes = append(state.mimes, r.Header.Get("Content-Type"))
++			if state.onUpload != nil {
++				state.onUpload(state.content)
++			}
++			_, _ = fmt.Fprintf(w, `{"content_uri":"mxc://synthetic/upload%d"}`, len(state.uploads))
++			return
++		}
++		if !strings.Contains(r.URL.Path, "/user/@synthetic:example.invalid/account_data/im.ponies.user_emotes") {
++			t.Errorf("unexpected route: %s", r.URL.Path)
++			w.WriteHeader(404)
++			return
++		}
++		switch r.Method {
++		case http.MethodGet:
++			if state.readError != 0 {
++				w.WriteHeader(state.readError)
++				_, _ = io.WriteString(w, `{"errcode":"M_FORBIDDEN","error":"synthetic"}`)
++				return
++			}
++			if state.content == nil {
++				w.WriteHeader(404)
++				_, _ = io.WriteString(w, `{"errcode":"M_NOT_FOUND","error":"absent"}`)
++				return
++			}
++			_ = json.NewEncoder(w).Encode(state.content)
++		case http.MethodPut:
++			if state.writeError != 0 {
++				w.WriteHeader(state.writeError)
++				_, _ = io.WriteString(w, `{"errcode":"M_FORBIDDEN","error":"synthetic"}`)
++				return
++			}
++			state.writes++
++			if err := json.NewDecoder(r.Body).Decode(&state.content); err != nil {
++				t.Error(err)
++			}
++			_, _ = io.WriteString(w, `{}`)
++		default:
++			t.Errorf("unexpected method: %s", r.Method)
++		}
++	}))
++	t.Cleanup(server.Close)
++	client, err := mautrix.NewClient(server.URL, "@synthetic:example.invalid", "synthetic-token")
++	if err != nil {
++		t.Fatal(err)
++	}
++	client.DefaultHTTPRetries = 0
++	return state, client
++}
++
++func syntheticFavorite(data []byte, lottie bool) appstate.Mutation {
++	hash := sha256.Sum256(data)
++	return appstate.Mutation{Operation: waServerSync.SyncdMutation_SET, Index: []string{appstate.IndexFavoriteSticker, base64.StdEncoding.EncodeToString(hash[:])}, Action: &waSyncAction.SyncActionValue{Timestamp: proto.Int64(100), StickerAction: &waSyncAction.StickerAction{IsFavorite: proto.Bool(true), IsLottie: proto.Bool(lottie), Width: proto.Uint32(512), Height: proto.Uint32(512), Mimetype: proto.String("image/webp"), DirectPath: proto.String("/synthetic"), MediaKey: bytes.Repeat([]byte{1}, 32), FileEncSHA256: bytes.Repeat([]byte{2}, 32)}}}
++}
++
++func syntheticImages(t *testing.T, state *syntheticFavoriteServer) map[string]json.RawMessage {
++	t.Helper()
++	state.mu.Lock()
++	defer state.mu.Unlock()
++	var images map[string]json.RawMessage
++	if err := json.Unmarshal(state.content["images"], &images); err != nil {
++		t.Fatal(err)
++	}
++	return images
++}
++
++func TestFavoriteStickerNewAccountPack(t *testing.T) {
++	state, client := newSyntheticFavoriteServer(t)
++	state.content = nil
++	data := []byte("synthetic new account")
++	mutation := syntheticFavorite(data, false)
++	err := syncFavoriteStickers(context.Background(), client, favoriteStickerPrefix("synthetic-login"), &events.FavoriteStickerSync{Mutations: []appstate.Mutation{mutation}, FromFullSync: true}, func(context.Context, *waE2E.StickerMessage) ([]byte, error) { return data, nil })
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(syntheticImages(t, state)) != 1 || state.writes != 1 {
++		t.Fatal("first snapshot did not create a pack")
++	}
++	var pack struct {
++		Name  string   `json:"display_name"`
++		Usage []string `json:"usage"`
++	}
++	if err = json.Unmarshal(state.content["pack"], &pack); err != nil {
++		t.Fatal(err)
++	}
++	if pack.Name != "WhatsApp" || len(pack.Usage) != 1 || pack.Usage[0] != "sticker" {
++		t.Fatalf("wrong default pack: %+v", pack)
++	}
++	state.writeError = 403
++	mutation.Operation = waServerSync.SyncdMutation_REMOVE
++	if err = syncFavoriteStickers(context.Background(), client, favoriteStickerPrefix("synthetic-login"), &events.FavoriteStickerSync{Mutations: []appstate.Mutation{mutation}}, nil); err == nil {
++		t.Fatal("account data write error was hidden")
++	}
++	if len(syntheticImages(t, state)) != 1 {
++		t.Fatal("failed publication changed the pack")
++	}
++}
++
++func TestFavoriteStickerHTTPAddRepeatRemove(t *testing.T) {
++	ctx := context.Background()
++	state, client := newSyntheticFavoriteServer(t)
++	data := []byte("synthetic original WebP bytes")
++	mutation := syntheticFavorite(data, false)
++	prefix := favoriteStickerPrefix("synthetic-login")
++	change, err := favoriteStickerMutation(prefix, mutation)
++	if err != nil {
++		t.Fatal(err)
++	}
++	downloads := 0
++	download := func(_ context.Context, msg *waE2E.StickerMessage) ([]byte, error) {
++		downloads++
++		if !bytes.Equal(msg.FileSHA256, change.Hash) || msg.GetDirectPath() != "/synthetic" {
++			t.Fatal("download lost encryption metadata")
++		}
++		return data, nil
++	}
++	state.onUpload = func(content map[string]json.RawMessage) { content["during_upload"] = json.RawMessage(`"preserved"`) }
++	batch := &events.FavoriteStickerSync{Mutations: []appstate.Mutation{mutation}}
++	if err = syncFavoriteStickers(ctx, client, prefix, batch, download); err != nil {
++		t.Fatal(err)
++	}
++	images := syntheticImages(t, state)
++	if len(images) != 2 || images["other_client"] == nil || !ownedFavoriteSticker(prefix, change.Key, images[change.Key]) {
++		t.Fatalf("bad merged images: %s", state.content["images"])
++	}
++	if state.content["during_upload"] == nil || state.content["custom"] == nil {
++		t.Fatal("lost foreign data")
++	}
++	if len(state.uploads) != 1 || !bytes.Equal(state.uploads[0], data) {
++		t.Fatal("original media changed")
++	}
++	if err = syncFavoriteStickers(ctx, client, prefix, batch, download); err != nil {
++		t.Fatal(err)
++	}
++	if state.writes != 1 || downloads != 1 {
++		t.Fatal("replayed favorite is not idempotent")
++	}
++	mutation.Operation = waServerSync.SyncdMutation_REMOVE
++	mutation.Action = nil
++	if err = syncFavoriteStickers(ctx, client, prefix, &events.FavoriteStickerSync{Mutations: []appstate.Mutation{mutation}}, download); err != nil {
++		t.Fatal(err)
++	}
++	images = syntheticImages(t, state)
++	if len(images) != 1 || images["other_client"] == nil || downloads != 1 {
++		t.Fatal("unfavorite removed foreign data or downloaded media")
++	}
++	if err = syncFavoriteStickers(ctx, client, prefix, &events.FavoriteStickerSync{Mutations: []appstate.Mutation{mutation}}, download); err != nil {
++		t.Fatal(err)
++	}
++	if state.writes != 2 {
++		t.Fatal("replayed removal wrote again")
++	}
++}
++
++func TestFavoriteStickerLottieOriginalAndDisplay(t *testing.T) {
++	state, client := newSyntheticFavoriteServer(t)
++	animation := []byte(`{"v":"5.7.4","fr":30,"ip":0,"op":30,"w":512,"h":512,"layers":[]}`)
++	original, err := msgconv.PackAnimatedSticker(animation)
++	if err != nil {
++		t.Fatal(err)
++	}
++	mutation := syntheticFavorite(original, true)
++	prefix := favoriteStickerPrefix("synthetic-login")
++	err = syncFavoriteStickers(context.Background(), client, prefix, &events.FavoriteStickerSync{Mutations: []appstate.Mutation{mutation}}, func(context.Context, *waE2E.StickerMessage) ([]byte, error) { return original, nil })
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(state.uploads) != 2 || !bytes.Equal(state.uploads[0], original) || !bytes.Equal(state.uploads[1], animation) {
++		t.Fatal("Lottie original or extracted animation changed")
++	}
++	if state.mimes[0] != "application/was" || state.mimes[1] != "video/lottie+json" {
++		t.Fatalf("wrong MIME types: %v", state.mimes)
++	}
++	change, _ := favoriteStickerMutation(prefix, mutation)
++	var entry struct {
++		URL  string `json:"url"`
++		Info struct {
++			Mimetype string `json:"mimetype"`
++		} `json:"info"`
++		Metadata struct {
++			AnimationURL  string `json:"animation_url"`
++			AnimationInfo struct {
++				Mimetype string `json:"mimetype"`
++			} `json:"animation_info"`
++		} `json:"fi.mau.whatsapp.favorite"`
++	}
++	if err = json.Unmarshal(syntheticImages(t, state)[change.Key], &entry); err != nil {
++		t.Fatal(err)
++	}
++	if entry.URL != "mxc://synthetic/upload1" || entry.Info.Mimetype != "application/was" || entry.Metadata.AnimationURL != "mxc://synthetic/upload2" || entry.Metadata.AnimationInfo.Mimetype != "video/lottie+json" {
++		t.Fatalf("wrong Lottie entry: %+v", entry)
++	}
++}
++
++func TestFavoriteStickerFullSnapshotAndSetFalse(t *testing.T) {
++	state, client := newSyntheticFavoriteServer(t)
++	ctx := context.Background()
++	prefix := favoriteStickerPrefix("synthetic-login")
++	first, second := []byte("synthetic one"), []byte("synthetic two")
++	firstMutation, secondMutation := syntheticFavorite(first, false), syntheticFavorite(second, false)
++	download := func(_ context.Context, msg *waE2E.StickerMessage) ([]byte, error) {
++		if bytes.Equal(msg.FileSHA256, sha256Bytes(first)) {
++			return first, nil
++		}
++		return second, nil
++	}
++	if err := syncFavoriteStickers(ctx, client, prefix, &events.FavoriteStickerSync{Mutations: []appstate.Mutation{firstMutation, secondMutation}, FromFullSync: true}, download); err != nil {
++		t.Fatal(err)
++	}
++	if err := syncFavoriteStickers(ctx, client, prefix, &events.FavoriteStickerSync{Mutations: []appstate.Mutation{secondMutation}, FromFullSync: true}, download); err != nil {
++		t.Fatal(err)
++	}
++	images := syntheticImages(t, state)
++	firstChange, _ := favoriteStickerMutation(prefix, firstMutation)
++	if len(images) != 2 || images[firstChange.Key] != nil {
++		t.Fatal("full snapshot retained absent own sticker")
++	}
++	secondMutation.Action.StickerAction.IsFavorite = proto.Bool(false)
++	if err := syncFavoriteStickers(ctx, client, prefix, &events.FavoriteStickerSync{Mutations: []appstate.Mutation{secondMutation}}, download); err != nil {
++		t.Fatal(err)
++	}
++	if len(syntheticImages(t, state)) != 1 {
++		t.Fatal("SET isFavorite=false did not remove")
++	}
++	if err := syncFavoriteStickers(ctx, client, prefix, &events.FavoriteStickerSync{Mutations: []appstate.Mutation{firstMutation}, FromFullSync: true}, download); err != nil {
++		t.Fatal(err)
++	}
++	if err := syncFavoriteStickers(ctx, client, prefix, &events.FavoriteStickerSync{FromFullSync: true}, download); err != nil {
++		t.Fatal(err)
++	}
++	if len(syntheticImages(t, state)) != 1 {
++		t.Fatal("empty snapshot retained stale own stickers")
++	}
++}
++
++func sha256Bytes(data []byte) []byte { sum := sha256.Sum256(data); return sum[:] }
++
++func TestFavoriteStickerFailuresDoNotPublish(t *testing.T) {
++	for _, scenario := range []string{"read", "upload", "download", "hash", "lottie", "malformed_images", "malformed_pack", "missing_action", "bad_hash", "collision"} {
++		t.Run(scenario, func(t *testing.T) {
++			state, client := newSyntheticFavoriteServer(t)
++			data := []byte("synthetic original")
++			mutation := syntheticFavorite(data, false)
++			prefix := favoriteStickerPrefix("synthetic-login")
++			download := func(context.Context, *waE2E.StickerMessage) ([]byte, error) {
++				if scenario == "download" {
++					return nil, errors.New("synthetic download failure")
++				}
++				if scenario == "hash" {
++					return []byte("wrong"), nil
++				}
++				return data, nil
++			}
++			switch scenario {
++			case "read":
++				state.readError = 403
++			case "upload":
++				state.uploadError = 500
++			case "lottie":
++				mutation.Action.StickerAction.IsLottie = proto.Bool(true)
++			case "malformed_images":
++				state.content["images"] = json.RawMessage(`[]`)
++			case "malformed_pack":
++				state.content["pack"] = json.RawMessage(`[]`)
++			case "missing_action":
++				mutation.Action = nil
++			case "bad_hash":
++				mutation.Index[1] = "bad"
++			case "collision":
++				change, _ := favoriteStickerMutation(prefix, mutation)
++				state.content["images"] = json.RawMessage(fmt.Sprintf(`{"%s":{"url":"mxc://synthetic/foreign"}}`, change.Key))
++			}
++			err := syncFavoriteStickers(context.Background(), client, prefix, &events.FavoriteStickerSync{Mutations: []appstate.Mutation{mutation}}, download)
++			if err == nil || state.writes != 0 {
++				t.Fatalf("failure published: error=%v writes=%d", err, state.writes)
++			}
++		})
++	}
++}
++
++func TestFavoriteStickerOwnershipAndMetadata(t *testing.T) {
++	prefix := favoriteStickerPrefix("synthetic-login")
++	mutation := syntheticFavorite([]byte("synthetic"), false)
++	change, _ := favoriteStickerMutation(prefix, mutation)
++	entry := favoriteStickerEntry(change, favoriteStickerMedia{MimeType: "image/webp"}, "mxc://synthetic/owned", "")
++	otherPrefix := favoriteStickerPrefix("another-synthetic-login")
++	foreignKey := otherPrefix + hex.EncodeToString(change.Hash)
++	current := favoriteStickerPack{Fields: map[string]json.RawMessage{"pack": json.RawMessage(`{"display_name":"My pack","usage":["emoticon","sticker"],"custom":true}`), "custom": json.RawMessage(`true`)}, Images: map[string]json.RawMessage{change.Key: entry, "foreign": json.RawMessage(`{"url":"mxc://synthetic/foreign"}`), foreignKey: entry}}
++	merged, err := mergeFavoriteStickerPack(current, prefix, nil, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var images map[string]json.RawMessage
++	_ = json.Unmarshal(merged["images"], &images)
++	if len(images) != 2 || images[foreignKey] == nil || current.Images[change.Key] == nil {
++		t.Fatal("ownership boundary or input immutability failed")
++	}
++	if string(merged["pack"]) != `{"custom":true,"display_name":"My pack","usage":["emoticon","sticker"]}` || merged["custom"] == nil {
++		t.Fatal("foreign metadata changed")
++	}
++}
+diff --git a/pkg/connector/favorite_timer_test.go b/pkg/connector/favorite_timer_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f6f1f07745311a7e0df294e177e83671104f2e0
+--- /dev/null
++++ b/pkg/connector/favorite_timer_test.go
+@@ -0,0 +1,60 @@
++package connector
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"testing"
++	"time"
++
++	"go.mau.fi/whatsmeow"
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/proto/waE2E"
++	"go.mau.fi/whatsmeow/types/events"
++)
++
++func TestFavoriteRealTimerPublishesWithoutNewEvent(t *testing.T) {
++	data := []byte("synthetic real timer recovery")
++	attempts := 0
++	uploaded := make(chan struct{}, 1)
++	fixture := newFavoriteRetryFixture(t, func(context.Context, *waE2E.StickerMessage) ([]byte, error) {
++		attempts++
++		if attempts == 1 {
++			return nil, whatsmeow.ErrMediaDownloadFailedWith403
++		}
++		return data, nil
++	})
++	fixture.matrix.onUpload = func(map[string]json.RawMessage) { uploaded <- struct{}{} }
++	if !fixture.wa.handleWAEvent(&events.FavoriteStickerSync{Mutations: []appstate.Mutation{syntheticFavorite(data, false)}}) {
++		t.Fatal("initial defer failed")
++	}
++	fixture.wa.Main.favoriteStickerLock.Lock(fixture.wa.UserLogin.User.MXID)
++	state := fixture.wa.favoriteStickerRetries
++	state.now = time.Now
++	state.afterFunc = time.AfterFunc
++	for _, pending := range state.pending {
++		pending.next = time.Now()
++	}
++	fixture.wa.scheduleFavoriteStickerRetries(fixture.wa.Main.Bridge.BackgroundCtx)
++	fixture.wa.Main.favoriteStickerLock.Unlock(fixture.wa.UserLogin.User.MXID)
++	select {
++	case <-uploaded:
++	case <-time.After(4 * time.Second):
++		t.Fatal("real timer did not upload recovered media")
++	}
++	fixture.wa.Main.favoriteStickerLock.Lock(fixture.wa.UserLogin.User.MXID)
++	defer fixture.wa.Main.favoriteStickerLock.Unlock(fixture.wa.UserLogin.User.MXID)
++	if attempts != 2 || len(syntheticImages(t, fixture.matrix)) != 2 || len(state.pending) != 0 || state.timer != nil {
++		t.Fatal("real timer lost publication or kept retrying")
++	}
++}
++
++func TestFavoriteCanceledDownloadDoesNotAcknowledgeBatch(t *testing.T) {
++	state, client := newSyntheticFavoriteServer(t)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	err := syncFavoriteStickers(ctx, client, favoriteStickerPrefix("synthetic-login"), &events.FavoriteStickerSync{Mutations: []appstate.Mutation{syntheticFavorite([]byte("synthetic cancel"), false)}}, func(context.Context, *waE2E.StickerMessage) ([]byte, error) { cancel(); return nil, ctx.Err() })
++	if !errors.Is(err, context.Canceled) || state.writes != 0 || len(state.uploads) != 0 {
++		t.Fatal("cancellation became a successful partial publication")
++	}
++}
+diff --git a/pkg/connector/handlewhatsapp.go b/pkg/connector/handlewhatsapp.go
+index 74606abe4f7b5be83922b0b3c678791044d3b658..cfbc8e0609ef3a91551edcc58c2ce8519a9053a9 100644
+--- a/pkg/connector/handlewhatsapp.go
++++ b/pkg/connector/handlewhatsapp.go
+@@ -82,9 +82,14 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
+ 
+ 	success = true
+ 	switch evt := rawEvt.(type) {
++	case *events.FavoriteStickerSync:
++		success = wa.handleFavoriteStickerSync(ctx, evt)
+ 	case *events.Blocklist:
+ 		success = wa.resyncBlocklist(ctx)()
+ 	case *events.Message:
++		if wa.handleFavoriteStickerReupload(ctx, evt) {
++			return true
++		}
+ 		success = wa.handleWAMessage(ctx, evt)
+ 	case *events.Receipt:
+ 		success = wa.handleWAReceipt(ctx, evt)
+@@ -174,6 +179,7 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
+ 		go wa.syncGhost(evt.JID, "business name event", nil)
+ 
+ 	case *events.Connected:
++		wa.resumeFavoriteStickerRetries(ctx)
+ 		log.Debug().Msg("Connected to WhatsApp socket")
+ 		wa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+ 		if wa.offlineSyncWaiter.Load() == nil {
+@@ -211,6 +217,7 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
+ 		}
+ 		wa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+ 		wa.notifyOfflineSyncWaiter(nil)
++		wa.ensureFavoriteStickerSnapshot(ctx)
+ 	case *events.LoggedOut:
+ 		wa.handleWALogout(ctx, evt.Reason, evt.OnConnect)
+ 		wa.notifyOfflineSyncWaiter(fmt.Errorf("logged out: %s", evt.Reason))

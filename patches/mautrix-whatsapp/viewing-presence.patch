@@ -1,0 +1,1149 @@
+diff --git a/pkg/connector/client.go b/pkg/connector/client.go
+index af7196f48b64c065b0914c8dd7ce094653d38912..e047e71e539ea0eaa6d5b11ba8b69df2bc33f782 100644
+--- a/pkg/connector/client.go
++++ b/pkg/connector/client.go
+@@ -122,7 +122,8 @@ type WhatsAppClient struct {
+ 	offlineSyncWaiter                atomic.Pointer[chan error]
+ 	isNewLogin                       bool
+ 	pushNamesSynced                  *exsync.Event
+-	lastPresence                     types.Presence
++	viewingOnce                      sync.Once
++	viewing                          *viewingPresence
+ 	blocklistLock                    sync.Mutex
+ 	favoriteStickerSnapshotSeen      atomic.Bool
+ 	favoriteStickerSnapshotRequested atomic.Bool
+@@ -402,6 +403,7 @@ func (wa *WhatsAppClient) Disconnect() {
+ }
+ 
+ func (wa *WhatsAppClient) LogoutRemote(ctx context.Context) {
++	wa.viewingOwner().stop()
+ 	if cli := wa.Client; cli != nil {
+ 		err := cli.Logout(ctx)
+ 		if err != nil {
+@@ -463,11 +465,8 @@ func (wa *WhatsAppClient) HandleMatrixViewingChat(ctx context.Context, msg *brid
+ 		presence = types.PresenceUnavailable
+ 	}
+ 
+-	if wa.lastPresence != presence {
+-		err := wa.updatePresence(ctx, presence)
+-		if err != nil {
+-			zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to set presence when viewing chat")
+-		}
++	if err := wa.updatePresence(ctx, presence); err != nil {
++		return fmt.Errorf("failed to set presence when viewing chat: %w", err)
+ 	}
+ 
+ 	if msg.Portal != nil && msg.Portal.ID == waid.MakePortalID(types.MuseJID) {
+@@ -504,11 +503,7 @@ func (wa *WhatsAppClient) HandleMatrixViewingChat(ctx context.Context, msg *brid
+ }
+ 
+ func (wa *WhatsAppClient) updatePresence(ctx context.Context, presence types.Presence) error {
+-	err := wa.Client.SendPresence(ctx, presence)
+-	if err == nil {
+-		wa.lastPresence = presence
+-	}
+-	return err
++	return wa.viewingOwner().legacy(ctx, presence)
+ }
+ 
+ func (wa *WhatsAppClient) DownloadImagePack(ctx context.Context, url string) (*bridgev2.ImportedImagePack, error) {
+diff --git a/pkg/connector/connector.go b/pkg/connector/connector.go
+index 2877793cb815454ab097e9b128fecfba2ef4c94e..c5c9d95908bd51fa007e06d8b4a31815a98aeb4e 100644
+--- a/pkg/connector/connector.go
++++ b/pkg/connector/connector.go
+@@ -143,6 +143,7 @@ func (wa *WhatsAppConnector) Init(bridge *bridgev2.Bridge) {
+ }
+ 
+ func (wa *WhatsAppConnector) Start(ctx context.Context) error {
++	wa.registerViewingRoutes()
+ 	if !wa.MsgConv.DirectMedia && wa.Config.LazyAvatars {
+ 		return fmt.Errorf("lazy_avatars set without enabling global direct_media")
+ 	}
+diff --git a/pkg/connector/handlematrix.go b/pkg/connector/handlematrix.go
+index a0650b8cb49c391b05f54202324384aaad61ce53..c664e2c47981d75eace9ab35b5de60d60367aaa9 100644
+--- a/pkg/connector/handlematrix.go
++++ b/pkg/connector/handlematrix.go
+@@ -382,7 +382,15 @@ func (wa *WhatsAppClient) HandleMatrixReadReceipt(ctx context.Context, receipt *
+ 	return err
+ }
+ 
+-func (wa *WhatsAppClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixTyping) (retErr error) {
++type chatPresenceSender interface {
++	SendChatPresence(context.Context, types.JID, types.ChatPresence, types.ChatPresenceMedia) error
++}
++
++func (wa *WhatsAppClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixTyping) error {
++	return wa.handleMatrixTyping(ctx, msg, wa.Client)
++}
++
++func (wa *WhatsAppClient) handleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixTyping, sender chatPresenceSender) (retErr error) {
+ 	portalJID, err := waid.ParsePortalID(msg.Portal.ID)
+ 	if err != nil {
+ 		return err
+@@ -410,7 +418,7 @@ func (wa *WhatsAppClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.
+ 			zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to set presence on typing")
+ 		}
+ 	}
+-	return wa.Client.SendChatPresence(ctx, portalJID, chatPresence, mediaPresence)
++	return sender.SendChatPresence(ctx, portalJID, chatPresence, mediaPresence)
+ }
+ 
+ var errUnsupportedDisappearingTimer = bridgev2.WrapErrorInStatus(errors.New("invalid value for disappearing timer")).WithErrorAsMessage().WithIsCertain(true).WithSendNotice(true)
+diff --git a/pkg/connector/handlewhatsapp.go b/pkg/connector/handlewhatsapp.go
+index cfbc8e0609ef3a91551edcc58c2ce8519a9053a9..71e47022fef3252a84a0b9c3435ab1ae0e8180e3 100644
+--- a/pkg/connector/handlewhatsapp.go
++++ b/pkg/connector/handlewhatsapp.go
+@@ -590,6 +590,7 @@ func (wa *WhatsAppClient) handleWAChatPresence(ctx context.Context, evt *events.
+ }
+ 
+ func (wa *WhatsAppClient) handleWALogout(ctx context.Context, reason events.ConnectFailureReason, onConnect bool) {
++	wa.viewingOwner().stop()
+ 	errorCode := WAUnknownLogout
+ 	if reason == events.ConnectFailureLoggedOut {
+ 		errorCode = WALoggedOut
+diff --git a/pkg/connector/viewing.go b/pkg/connector/viewing.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..b2aee4b4ce8cde434df7ebdfb3607a61b3813f54
+--- /dev/null
++++ b/pkg/connector/viewing.go
+@@ -0,0 +1,209 @@
++package connector
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"time"
++
++	"go.mau.fi/whatsmeow/types"
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/id"
++)
++
++// Os prazos são os aprovados para a extensão Chatty, não defaults do WhatsApp.
++const viewingLeaseTTL = 15 * time.Second
++const viewingRenewInterval = 5 * time.Second
++const viewingPresenceTimeout = 10 * time.Second
++const viewingRetryInterval = time.Second
++
++var errViewingStopped = errors.New("viewing presence owner stopped")
++
++type viewingDevice struct {
++	user   id.UserID
++	device id.DeviceID
++}
++
++type viewingLease struct {
++	generation uint64
++	room       id.RoomID
++	expires    time.Time
++}
++
++type viewingTimer interface{ Stop() bool }
++
++// Este lock é o único dono dos leases e de TODOS os envios de presença da conta.
++// Gerações encerradas ficam em memória até logout/restart para impedir replay;
++// a rota e o protocolo estão documentados no README do patch.
++type viewingPresence struct {
++	mu              sync.Mutex
++	ctx             context.Context
++	now             func() time.Time
++	afterFunc       func(time.Duration, func()) viewingTimer
++	send            func(context.Context, types.Presence) error
++	reportFailure   func()
++	leases          map[viewingDevice]viewingLease
++	confirmed       types.Presence
++	timer           viewingTimer
++	timerGeneration uint64
++	stopped         bool
++}
++
++func newViewingPresence(ctx context.Context, send func(context.Context, types.Presence) error, reportFailure func()) *viewingPresence {
++	owner := &viewingPresence{
++		ctx: ctx, now: time.Now,
++		afterFunc: func(delay time.Duration, callback func()) viewingTimer { return time.AfterFunc(delay, callback) },
++		send:      send, reportFailure: reportFailure,
++		leases: make(map[viewingDevice]viewingLease),
++	}
++	context.AfterFunc(ctx, owner.stop)
++	return owner
++}
++
++func (wa *WhatsAppClient) viewingOwner() *viewingPresence {
++	wa.viewingOnce.Do(func() {
++		wa.viewing = newViewingPresence(wa.Main.Bridge.BackgroundCtx, func(ctx context.Context, presence types.Presence) error {
++			if wa.Client == nil {
++				return bridgev2.ErrNotLoggedIn
++			}
++			return wa.Client.SendPresence(ctx, presence)
++		}, func() {
++			wa.UserLogin.Log.Warn().Msg("Failed to reconcile conversation viewing presence")
++		})
++	})
++	return wa.viewing
++}
++
++func (owner *viewingPresence) stop() {
++	owner.mu.Lock()
++	defer owner.mu.Unlock()
++	owner.stopped = true
++	owner.cancelTimerLocked()
++	clear(owner.leases)
++}
++
++func (owner *viewingPresence) expireLocked() {
++	now := owner.now()
++	for key, lease := range owner.leases {
++		if lease.room != "" && !now.Before(lease.expires) {
++			lease.room = ""
++			owner.leases[key] = lease
++		}
++	}
++}
++
++func (owner *viewingPresence) desiredLocked() types.Presence {
++	for _, lease := range owner.leases {
++		if lease.room != "" {
++			return types.PresenceAvailable
++		}
++	}
++	return types.PresenceUnavailable
++}
++
++func (owner *viewingPresence) sendLocked(ctx context.Context, presence types.Presence) error {
++	ctx, cancel := context.WithTimeout(ctx, viewingPresenceTimeout)
++	defer cancel()
++	if err := owner.send(ctx, presence); err != nil {
++		owner.confirmed = ""
++		return err
++	}
++	owner.confirmed = presence
++	return nil
++}
++
++func (owner *viewingPresence) reconcileLocked(ctx context.Context) error {
++	owner.expireLocked()
++	desired := owner.desiredLocked()
++	if owner.confirmed == desired {
++		return nil
++	}
++	return owner.sendLocked(ctx, desired)
++}
++
++func (owner *viewingPresence) apply(ctx context.Context, device viewingDevice, generation uint64, room id.RoomID) (bool, error) {
++	owner.mu.Lock()
++	defer owner.mu.Unlock()
++	if owner.stopped || owner.ctx.Err() != nil {
++		return false, errViewingStopped
++	}
++	owner.expireLocked()
++	previous := owner.leases[device]
++	accepted := generation > previous.generation
++	if accepted {
++		owner.leases[device] = viewingLease{generation: generation, room: room, expires: owner.now().Add(viewingLeaseTTL)}
++	}
++	// Duplicatas podem repetir um envio que falhou, mas NUNCA prorrogam o lease.
++	err := owner.reconcileLocked(ctx)
++	owner.scheduleLocked(err != nil)
++	return accepted, err
++}
++
++func (owner *viewingPresence) generation(device viewingDevice) uint64 {
++	owner.mu.Lock()
++	defer owner.mu.Unlock()
++	return owner.leases[device].generation
++}
++
++func (owner *viewingPresence) legacy(ctx context.Context, presence types.Presence) error {
++	owner.mu.Lock()
++	defer owner.mu.Unlock()
++	if owner.stopped || owner.ctx.Err() != nil {
++		return errViewingStopped
++	}
++	owner.expireLocked()
++	// Reenvio offline é intencional: push-name/conexão precisam anunciar o nome.
++	// Reaplicar a união dentro do mesmo lock impede um offline tardio apagar foco.
++	if err := owner.sendLocked(ctx, presence); err != nil {
++		owner.scheduleLocked(true)
++		return err
++	}
++	if presence == types.PresenceUnavailable && owner.desiredLocked() == types.PresenceAvailable {
++		err := owner.reconcileLocked(ctx)
++		owner.scheduleLocked(err != nil)
++		return err
++	}
++	owner.scheduleLocked(false)
++	return nil
++}
++
++func (owner *viewingPresence) cancelTimerLocked() {
++	owner.timerGeneration++
++	if owner.timer != nil {
++		owner.timer.Stop()
++		owner.timer = nil
++	}
++}
++
++func (owner *viewingPresence) scheduleLocked(retry bool) {
++	owner.cancelTimerLocked()
++	if owner.stopped || owner.ctx.Err() != nil {
++		return
++	}
++	now := owner.now()
++	var deadline time.Time
++	for _, lease := range owner.leases {
++		if lease.room != "" && (deadline.IsZero() || lease.expires.Before(deadline)) {
++			deadline = lease.expires
++		}
++	}
++	if retry && (deadline.IsZero() || now.Add(viewingRetryInterval).Before(deadline)) {
++		deadline = now.Add(viewingRetryInterval)
++	}
++	if deadline.IsZero() {
++		return
++	}
++	generation := owner.timerGeneration
++	owner.timer = owner.afterFunc(deadline.Sub(now), func() {
++		owner.mu.Lock()
++		defer owner.mu.Unlock()
++		if owner.stopped || owner.ctx.Err() != nil || generation != owner.timerGeneration {
++			return
++		}
++		err := owner.reconcileLocked(owner.ctx)
++		if err != nil {
++			owner.reportFailure()
++		}
++		owner.scheduleLocked(err != nil)
++	})
++}
+diff --git a/pkg/connector/viewing_http.go b/pkg/connector/viewing_http.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..407610325277e6a331cca0412869b846004636a4
+--- /dev/null
++++ b/pkg/connector/viewing_http.go
+@@ -0,0 +1,134 @@
++package connector
++
++import (
++	"encoding/json"
++	"io"
++	"net/http"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/rs/zerolog"
++	"maunium.net/go/mautrix"
++	"maunium.net/go/mautrix/bridgev2/matrix"
++	"maunium.net/go/mautrix/bridgev2/networkid"
++	"maunium.net/go/mautrix/event"
++	"maunium.net/go/mautrix/id"
++)
++
++const viewingRoute = "/v3/chatty/viewing/{loginID}"
++
++type viewingRequest struct {
++	Generation uint64    `json:"generation,string"`
++	RoomID     id.RoomID `json:"room_id"`
++	Left       bool      `json:"left"`
++}
++
++type viewingResponse struct {
++	Version      int    `json:"version"`
++	LeaseSeconds int    `json:"lease_seconds"`
++	RenewSeconds int    `json:"renew_seconds"`
++	Generation   uint64 `json:"generation,string"`
++	Accepted     bool   `json:"accepted"`
++}
++
++func (wa *WhatsAppConnector) registerViewingRoutes() {
++	mx, ok := wa.Bridge.Matrix.(*matrix.Connector)
++	if !ok {
++		return
++	}
++	router := mx.GetProvisioning().GetRouter()
++	router.HandleFunc("GET "+viewingRoute, wa.handleViewing)
++	router.HandleFunc("POST "+viewingRoute, wa.handleViewing)
++}
++
++func (wa *WhatsAppConnector) handleViewing(w http.ResponseWriter, r *http.Request) {
++	w.Header().Set("Cache-Control", "no-store")
++	mx := wa.Bridge.Matrix.(*matrix.Connector)
++	user := mx.GetProvisioning().GetUser(r)
++	// O middleware também aceita shared secret/OpenID; esta rota exige token Matrix
++	// com aparelho comprovado por whoami, nunca identidade enviada pelo cliente.
++	token, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
++	if !bearer || token == "" || token == mx.Config.Provisioning.SharedSecret || strings.HasPrefix(token, "openid:") {
++		mautrix.MUnknownToken.WithMessage("A Matrix device access token is required").Write(w)
++		return
++	}
++	client, err := mautrix.NewClient(mx.Config.Homeserver.Address, user.MXID, token)
++	if err != nil {
++		mautrix.MUnknown.WithMessage("Matrix authentication unavailable").Write(w)
++		return
++	}
++	client.Log = zerolog.Nop()
++	client.DefaultHTTPRetries = 0
++	client.IgnoreRateLimit = true
++	client.Client = &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
++	identity, err := client.Whoami(r.Context())
++	if err != nil || identity.UserID != user.MXID || identity.DeviceID == "" {
++		mautrix.MUnknownToken.WithMessage("A valid Matrix device access token is required").Write(w)
++		return
++	}
++	login, err := wa.Bridge.GetExistingUserLoginByID(r.Context(), networkid.UserLoginID(r.PathValue("loginID")))
++	if err != nil {
++		mautrix.MUnknown.WithMessage("Failed to look up login").Write(w)
++		return
++	}
++	if login == nil || login.UserMXID != identity.UserID {
++		mautrix.MForbidden.WithMessage("Login is not owned by this user").Write(w)
++		return
++	}
++	clientWA, ok := login.Client.(*WhatsAppClient)
++	if !ok || clientWA.Client == nil {
++		mautrix.MForbidden.WithMessage("WhatsApp login is unavailable").Write(w)
++		return
++	}
++	device := viewingDevice{user: identity.UserID, device: identity.DeviceID}
++	owner := clientWA.viewingOwner()
++	accepted := false
++	if r.Method == http.MethodPost {
++		var request viewingRequest
++		decoder := json.NewDecoder(r.Body)
++		decoder.DisallowUnknownFields()
++		if err = decoder.Decode(&request); err != nil || decoder.Decode(new(any)) != io.EOF || request.Generation == 0 || (request.RoomID == "") != request.Left {
++			mautrix.MBadJSON.WithMessage("Expected a positive generation string and either room_id or left:true").Write(w)
++			return
++		}
++		if request.RoomID != "" {
++			portal, lookupErr := wa.Bridge.GetPortalByMXID(r.Context(), request.RoomID)
++			if lookupErr != nil {
++				mautrix.MUnknown.WithMessage("Failed to look up portal").Write(w)
++				return
++			}
++			if portal == nil {
++				mautrix.MForbidden.WithMessage("Room is not a portal of this login").Write(w)
++				return
++			}
++			mapping, lookupErr := wa.Bridge.DB.UserPortal.Get(r.Context(), login.UserLogin, portal.PortalKey)
++			if lookupErr != nil {
++				mautrix.MUnknown.WithMessage("Failed to look up portal access").Write(w)
++				return
++			}
++			if mapping == nil || (portal.Receiver != "" && portal.Receiver != login.ID) {
++				mautrix.MForbidden.WithMessage("Room is not a portal of this login").Write(w)
++				return
++			}
++			var member event.MemberEventContent
++			if err = client.StateEvent(r.Context(), request.RoomID, event.StateMember, string(identity.UserID), &member); err != nil || member.Membership != event.MembershipJoin {
++				mautrix.MForbidden.WithMessage("User is not joined to this portal").Write(w)
++				return
++			}
++		}
++		accepted, err = owner.apply(r.Context(), device, request.Generation, request.RoomID)
++		if err != nil {
++			// Não serializar erros de rede: podem conter dados externos sensíveis.
++			mautrix.RespError{ErrCode: "FI.MAU.PRESENCE_FAILED", Err: "Failed to apply WhatsApp presence", StatusCode: http.StatusBadGateway}.Write(w)
++			return
++		}
++	}
++	w.Header().Set("Content-Type", "application/json")
++	response := viewingResponse{Version: 1, LeaseSeconds: int(viewingLeaseTTL / time.Second), RenewSeconds: int(viewingRenewInterval / time.Second), Generation: owner.generation(device), Accepted: accepted}
++	// A resposta é pequena e não contém token, sala ou conteúdo de conversa.
++	payload, _ := json.Marshal(response)
++	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
++	w.WriteHeader(http.StatusOK)
++	_, _ = w.Write(payload)
++}
+diff --git a/pkg/connector/viewing_http_test.go b/pkg/connector/viewing_http_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..f729dac9b3e7cbbdc301de7be84a75cd0b6814f9
+--- /dev/null
++++ b/pkg/connector/viewing_http_test.go
+@@ -0,0 +1,254 @@
++package connector
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"reflect"
++	"strings"
++	"testing"
++
++	"github.com/rs/zerolog"
++	"go.mau.fi/whatsmeow/types"
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
++	"maunium.net/go/mautrix/bridgev2/commands"
++	"maunium.net/go/mautrix/bridgev2/database"
++	"maunium.net/go/mautrix/bridgev2/matrix"
++	"maunium.net/go/mautrix/bridgev2/networkid"
++	"maunium.net/go/mautrix/id"
++
++	"go.mau.fi/mautrix-whatsapp/pkg/waid"
++)
++
++type viewingHTTPNetwork struct {
++	*historyNetwork
++	client *WhatsAppClient
++}
++
++func (network *viewingHTTPNetwork) LoadUserLogin(_ context.Context, login *bridgev2.UserLogin) error {
++	if login.ID == "synthetic-login" {
++		network.client.UserLogin = login
++		login.Client = network.client
++	} else {
++		login.Client = &WhatsAppClient{Main: network.WhatsAppConnector, UserLogin: login}
++	}
++	return nil
++}
++
++type viewingHTTPFixture struct {
++	client *WhatsAppClient
++	owner  *viewingPresence
++	clock  *viewingTestClock
++	sent   *[]types.Presence
++	server *httptest.Server
++	logs   *bytes.Buffer
++}
++
++func newViewingHTTPFixture(t *testing.T) *viewingHTTPFixture {
++	t.Helper()
++	original, _ := newHistoryClient(t)
++	wa := original.WhatsAppClient
++	logs := &bytes.Buffer{}
++	bridge := wa.Main.Bridge
++	bridge.Log = zerolog.New(logs)
++	bridge.Config.Permissions = bridgeconfig.PermissionConfig{"*": &bridgeconfig.PermissionLevelUser}
++	bridge.Network = &viewingHTTPNetwork{historyNetwork: &historyNetwork{wa.Main}, client: wa}
++	homeserver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		token := r.Header.Get("Authorization")
++		if strings.HasSuffix(r.URL.Path, "/account/whoami") {
++			switch token {
++			case "Bearer synthetic-mac":
++				_, _ = io.WriteString(w, `{"user_id":"@owner:example.invalid","device_id":"MAC"}`)
++			case "Bearer synthetic-phone":
++				_, _ = io.WriteString(w, `{"user_id":"@owner:example.invalid","device_id":"PHONE"}`)
++			case "Bearer synthetic-other":
++				_, _ = io.WriteString(w, `{"user_id":"@other:example.invalid","device_id":"OTHER"}`)
++			case "Bearer synthetic-no-device":
++				_, _ = io.WriteString(w, `{"user_id":"@owner:example.invalid"}`)
++			default:
++				w.WriteHeader(http.StatusUnauthorized)
++				_, _ = io.WriteString(w, `{"errcode":"M_UNKNOWN_TOKEN","error":"invalid synthetic token"}`)
++			}
++		} else if strings.Contains(r.URL.Path, "/state/m.room.member/") {
++			if strings.Contains(r.URL.Path, "!not-joined:") {
++				_, _ = io.WriteString(w, `{"membership":"leave"}`)
++			} else {
++				_, _ = io.WriteString(w, `{"membership":"join"}`)
++			}
++		} else {
++			t.Errorf("unexpected homeserver I/O: %s", r.URL.Path)
++			w.WriteHeader(http.StatusNotFound)
++		}
++	}))
++	t.Cleanup(homeserver.Close)
++	cfg := &bridgeconfig.Config{Bridge: *bridge.Config}
++	cfg.Homeserver.Address, cfg.Homeserver.Domain = homeserver.URL, "example.invalid"
++	cfg.AppService.UsernameTemplate, cfg.AppService.Bot.Username = "ghost_{{.}}", "bot"
++	cfg.Provisioning.SharedSecret, cfg.Provisioning.AllowMatrixAuth = "synthetic-shared-secret", true
++	mx := matrix.NewConnector(cfg)
++	bridge.Commands = commands.NewProcessor(bridge)
++	bridge.Matrix = mx
++	mx.Init(bridge)
++	mx.Provisioning.Init()
++	wa.Main.registerViewingRoutes()
++	owner, clock, sent := newViewingTestOwner(t)
++	wa.viewingOnce.Do(func() { wa.viewing = owner })
++	ctx := context.Background()
++	for _, room := range []string{"owned", "foreign", "not-joined", "wrong-receiver"} {
++		portal := &database.Portal{PortalKey: networkid.PortalKey{ID: networkid.PortalID("15550000002@s.whatsapp.net" + room), Receiver: "synthetic-login"}, MXID: id.RoomID("!" + room + ":example.invalid"), Metadata: &waid.PortalMetadata{}}
++		if room == "wrong-receiver" {
++			portal.Receiver = "another-login"
++		}
++		if err := bridge.DB.Portal.Insert(ctx, portal); err != nil {
++			t.Fatal(err)
++		}
++		if room != "foreign" {
++			if err := bridge.DB.UserPortal.Put(ctx, database.UserPortalFor(wa.UserLogin.UserLogin, portal.PortalKey)); err != nil {
++				t.Fatal(err)
++			}
++		}
++	}
++	server := httptest.NewServer(mx.AS.Router)
++	t.Cleanup(server.Close)
++	return &viewingHTTPFixture{client: wa, owner: owner, clock: clock, sent: sent, server: server, logs: logs}
++}
++
++func (fixture *viewingHTTPFixture) request(t *testing.T, method, token, user, login, body string) (int, []byte) {
++	t.Helper()
++	request, err := http.NewRequest(method, fixture.server.URL+"/_matrix/provision/v3/chatty/viewing/"+login+"?user_id="+user, strings.NewReader(body))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if token != "" {
++		request.Header.Set("Authorization", "Bearer "+token)
++	}
++	request.Header.Set("Content-Type", "application/json")
++	response, err := fixture.server.Client().Do(request)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer response.Body.Close()
++	data, err := io.ReadAll(response.Body)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return response.StatusCode, data
++}
++
++func TestViewingHTTPRejections(t *testing.T) {
++	for _, test := range []struct {
++		name, token, user, login, body string
++		status                         int
++	}{
++		{"missing token", "", "@owner:example.invalid", "synthetic-login", `{"generation":"1","room_id":"!owned:example.invalid"}`, 401},
++		{"invalid token", "synthetic-invalid", "@owner:example.invalid", "synthetic-login", `{"generation":"1","room_id":"!owned:example.invalid"}`, 401},
++		{"forged user", "synthetic-mac", "@other:example.invalid", "synthetic-login", `{"generation":"1","room_id":"!owned:example.invalid"}`, 401},
++		{"foreign login", "synthetic-other", "@other:example.invalid", "synthetic-login", `{"generation":"1","room_id":"!owned:example.invalid"}`, 403},
++		{"unknown login", "synthetic-mac", "@owner:example.invalid", "missing", `{"generation":"1","room_id":"!owned:example.invalid"}`, 403},
++		{"no device", "synthetic-no-device", "@owner:example.invalid", "synthetic-login", `{"generation":"1","room_id":"!owned:example.invalid"}`, 401},
++		{"shared secret", "synthetic-shared-secret", "@owner:example.invalid", "synthetic-login", `{"generation":"1","room_id":"!owned:example.invalid"}`, 401},
++		{"unknown room", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"generation":"1","room_id":"!missing:example.invalid"}`, 403},
++		{"foreign portal", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"generation":"1","room_id":"!foreign:example.invalid"}`, 403},
++		{"wrong receiver", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"generation":"1","room_id":"!wrong-receiver:example.invalid"}`, 403},
++		{"not joined", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"generation":"1","room_id":"!not-joined:example.invalid"}`, 403},
++		{"forged device", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"generation":"1","room_id":"!owned:example.invalid","device_id":"PHONE"}`, 400},
++		{"zero generation", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"generation":"0","room_id":"!owned:example.invalid"}`, 400},
++		{"missing generation", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"room_id":"!owned:example.invalid"}`, 400},
++		{"overflow generation", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"generation":"18446744073709551616","room_id":"!owned:example.invalid"}`, 400},
++		{"numeric generation", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"generation":1,"room_id":"!owned:example.invalid"}`, 400},
++		{"both states", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"generation":"1","room_id":"!owned:example.invalid","left":true}`, 400},
++		{"neither state", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"generation":"1"}`, 400},
++		{"invalid JSON", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{`, 400},
++		{"trailing JSON", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"generation":"1","left":true} {}`, 400},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			fixture := newViewingHTTPFixture(t)
++			before, err := fixture.client.Main.Bridge.DB.Portal.GetAll(context.Background())
++			if err != nil {
++				t.Fatal(err)
++			}
++			status, data := fixture.request(t, "POST", test.token, test.user, test.login, test.body)
++			if status != test.status {
++				t.Fatalf("status=%d want=%d body=%s", status, test.status, data)
++			}
++			after, err := fixture.client.Main.Bridge.DB.Portal.GetAll(context.Background())
++			if err != nil {
++				t.Fatal(err)
++			}
++			if len(*fixture.sent) != 0 || fixture.owner.generation(viewingMac) != 0 || len(before) != len(after) {
++				t.Fatal("rejected request mutated presence/leases/portals")
++			}
++			if strings.Contains(fixture.logs.String(), test.token) && test.token != "" {
++				t.Fatal("token leaked into bridge logs")
++			}
++			if strings.Contains(fixture.logs.String(), "!owned:example.invalid") {
++				t.Fatal("room body leaked into bridge logs")
++			}
++		})
++	}
++}
++
++func TestViewingHTTPCapabilityUnionAndErrors(t *testing.T) {
++	fixture := newViewingHTTPFixture(t)
++	status, data := fixture.request(t, "GET", "synthetic-mac", "@owner:example.invalid", "synthetic-login", "")
++	var capability viewingResponse
++	if err := json.Unmarshal(data, &capability); err != nil {
++		t.Fatal(err)
++	}
++	if status != 200 || capability.Version != 1 || capability.LeaseSeconds != 15 || capability.RenewSeconds != 5 || capability.Generation != 0 {
++		t.Fatalf("capability: %d %s", status, data)
++	}
++	for _, call := range []struct{ token, body string }{
++		{"synthetic-mac", `{"generation":"1","room_id":"!owned:example.invalid"}`},
++		{"synthetic-phone", `{"generation":"1","left":true}`},
++		{"synthetic-mac", `{"generation":"1","left":true}`},
++	} {
++		status, data = fixture.request(t, "POST", call.token, "@owner:example.invalid", "synthetic-login", call.body)
++		if status != 200 {
++			t.Fatalf("status=%d %s", status, data)
++		}
++	}
++	if !reflect.DeepEqual(*fixture.sent, []types.Presence{types.PresenceAvailable}) {
++		t.Fatalf("device union failed: %v", *fixture.sent)
++	}
++	status, data = fixture.request(t, "GET", "synthetic-mac", "@owner:example.invalid", "synthetic-login", "")
++	if err := json.Unmarshal(data, &capability); err != nil {
++		t.Fatal(err)
++	}
++	if status != 200 || capability.Generation != 1 {
++		t.Fatal("capability did not return device high-water mark")
++	}
++	fixture.owner.send = func(context.Context, types.Presence) error { return errors.New("synthetic external secret") }
++	status, data = fixture.request(t, "POST", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"generation":"2","left":true}`)
++	if status != 502 || !strings.Contains(string(data), "FI.MAU.PRESENCE_FAILED") || strings.Contains(string(data), "synthetic external secret") {
++		t.Fatalf("error not propagated/sanitized: %d %s", status, data)
++	}
++}
++
++func TestViewingHTTPDuplicateDoesNotRenew(t *testing.T) {
++	fixture := newViewingHTTPFixture(t)
++	for index := 0; index < 3; index++ {
++		status, data := fixture.request(t, "POST", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"generation":"9","room_id":"!owned:example.invalid"}`)
++		if status != 200 {
++			t.Fatalf("%d %s", status, data)
++		}
++		fixture.clock.advance(viewingRenewInterval)
++	}
++	if !reflect.DeepEqual(*fixture.sent, []types.Presence{types.PresenceAvailable, types.PresenceUnavailable}) {
++		t.Fatalf("HTTP duplicate extended TTL: %v", *fixture.sent)
++	}
++	status, data := fixture.request(t, "POST", "synthetic-mac", "@owner:example.invalid", "synthetic-login", `{"generation":"8","room_id":"!owned:example.invalid"}`)
++	if status != 200 {
++		t.Fatalf("%d %s", status, data)
++	}
++	if len(*fixture.sent) != 2 {
++		t.Fatal("reordered request revived expired contribution")
++	}
++	t.Logf("HTTP surface: capability, focus, two-device union, duplicate/reordered expiry and 502 exercised on %s", fmt.Sprintf("local synthetic server"))
++}
+diff --git a/pkg/connector/viewing_test.go b/pkg/connector/viewing_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..3393d0eb50f0b9a83fb8bacc23af23a79c7c14be
+--- /dev/null
++++ b/pkg/connector/viewing_test.go
+@@ -0,0 +1,268 @@
++package connector
++
++import (
++	"context"
++	"errors"
++	"reflect"
++	"sync"
++	"testing"
++	"time"
++
++	"go.mau.fi/whatsmeow/types"
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/id"
++)
++
++func TestViewingPresenceError(t *testing.T) {
++	client, _ := newHistoryClient(t)
++	t.Cleanup(func() { client.viewingOwner().stop() })
++	err := client.HandleMatrixViewingChat(context.Background(), &bridgev2.MatrixViewingChat{})
++	if err == nil {
++		t.Fatal("presence send failure must reach the caller")
++	}
++}
++
++type viewingTestTimer struct {
++	clock    *viewingTestClock
++	at       time.Time
++	callback func()
++	stopped  bool
++}
++
++func (timer *viewingTestTimer) Stop() bool {
++	timer.clock.mu.Lock()
++	defer timer.clock.mu.Unlock()
++	wasActive := !timer.stopped
++	timer.stopped = true
++	return wasActive
++}
++
++type viewingTestClock struct {
++	mu      sync.Mutex
++	current time.Time
++	timers  []*viewingTestTimer
++}
++
++func (clock *viewingTestClock) now() time.Time {
++	clock.mu.Lock()
++	defer clock.mu.Unlock()
++	return clock.current
++}
++func (clock *viewingTestClock) after(delay time.Duration, callback func()) viewingTimer {
++	clock.mu.Lock()
++	defer clock.mu.Unlock()
++	timer := &viewingTestTimer{clock: clock, at: clock.current.Add(delay), callback: callback}
++	clock.timers = append(clock.timers, timer)
++	return timer
++}
++func (clock *viewingTestClock) advance(delay time.Duration) {
++	clock.mu.Lock()
++	clock.current = clock.current.Add(delay)
++	clock.mu.Unlock()
++	for {
++		clock.mu.Lock()
++		var due *viewingTestTimer
++		for _, timer := range clock.timers {
++			if !timer.stopped && !clock.current.Before(timer.at) {
++				due = timer
++				timer.stopped = true
++				break
++			}
++		}
++		clock.mu.Unlock()
++		if due == nil {
++			return
++		}
++		due.callback()
++	}
++}
++
++func newViewingTestOwner(t *testing.T) (*viewingPresence, *viewingTestClock, *[]types.Presence) {
++	t.Helper()
++	clock := &viewingTestClock{current: time.Now()}
++	var sent []types.Presence
++	owner := newViewingPresence(context.Background(), func(_ context.Context, presence types.Presence) error {
++		sent = append(sent, presence)
++		return nil
++	}, func() {})
++	owner.now, owner.afterFunc = clock.now, clock.after
++	t.Cleanup(owner.stop)
++	return owner, clock, &sent
++}
++
++var viewingMac = viewingDevice{user: "@owner:example.invalid", device: "MAC"}
++var viewingPhone = viewingDevice{user: "@owner:example.invalid", device: "PHONE"}
++
++func applyViewing(t *testing.T, owner *viewingPresence, device viewingDevice, generation uint64, room string, wantAccepted bool) {
++	t.Helper()
++	accepted, err := owner.apply(context.Background(), device, generation, id.RoomID(room))
++	if err != nil || accepted != wantAccepted {
++		t.Fatalf("apply generation %d: accepted=%v err=%v", generation, accepted, err)
++	}
++}
++
++func TestViewingUnionAndExactExpiry(t *testing.T) {
++	owner, clock, sent := newViewingTestOwner(t)
++	applyViewing(t, owner, viewingMac, 1, "!mac:example.invalid", true)
++	applyViewing(t, owner, viewingPhone, 1, "", true)
++	if !reflect.DeepEqual(*sent, []types.Presence{types.PresenceAvailable}) {
++		t.Fatalf("phone left changed Mac presence: %v", *sent)
++	}
++	clock.advance(5 * time.Second)
++	applyViewing(t, owner, viewingPhone, 2, "!phone:example.invalid", true)
++	clock.advance(10 * time.Second)
++	if len(*sent) != 1 {
++		t.Fatalf("first expiry removed second device: %v", *sent)
++	}
++	clock.advance(5*time.Second - time.Nanosecond)
++	if len(*sent) != 1 {
++		t.Fatal("lease expired before exact limit")
++	}
++	clock.advance(time.Nanosecond)
++	if !reflect.DeepEqual(*sent, []types.Presence{types.PresenceAvailable, types.PresenceUnavailable}) {
++		t.Fatalf("last expiry did not go offline: %v", *sent)
++	}
++}
++
++func TestViewingGenerationReplayAndStaleTimers(t *testing.T) {
++	owner, clock, sent := newViewingTestOwner(t)
++	applyViewing(t, owner, viewingMac, 3, "!a:example.invalid", true)
++	stale := clock.timers[0].callback
++	clock.advance(5 * time.Second)
++	applyViewing(t, owner, viewingMac, 4, "!b:example.invalid", true)
++	applyViewing(t, owner, viewingMac, 3, "", false)
++	stale()
++	clock.advance(10 * time.Second)
++	applyViewing(t, owner, viewingMac, 4, "!b:example.invalid", false)
++	clock.advance(5 * time.Second)
++	if len(*sent) != 2 || (*sent)[1] != types.PresenceUnavailable {
++		t.Fatalf("duplicate extended expiry: %v", *sent)
++	}
++	applyViewing(t, owner, viewingMac, 4, "!b:example.invalid", false)
++	applyViewing(t, owner, viewingMac, 2, "!a:example.invalid", false)
++	if len(*sent) != 2 {
++		t.Fatal("replay revived expired lease")
++	}
++	applyViewing(t, owner, viewingMac, 5, "!a:example.invalid", true)
++	applyViewing(t, owner, viewingMac, 6, "", true)
++	applyViewing(t, owner, viewingMac, 5, "!a:example.invalid", false)
++	if len(*sent) != 4 || (*sent)[3] != types.PresenceUnavailable {
++		t.Fatalf("left replay revived lease: %v", *sent)
++	}
++}
++
++func TestViewingRenewalAndIndependentLeft(t *testing.T) {
++	owner, clock, sent := newViewingTestOwner(t)
++	applyViewing(t, owner, viewingMac, 1, "!a:example.invalid", true)
++	applyViewing(t, owner, viewingPhone, 1, "!b:example.invalid", true)
++	clock.advance(5 * time.Second)
++	applyViewing(t, owner, viewingMac, 2, "!a:example.invalid", true)
++	applyViewing(t, owner, viewingPhone, 2, "", true)
++	clock.advance(10 * time.Second)
++	if len(*sent) != 1 {
++		t.Fatalf("renewal not honored or other device left won: %v", *sent)
++	}
++	applyViewing(t, owner, viewingMac, 3, "", true)
++	if len(*sent) != 2 || (*sent)[1] != types.PresenceUnavailable {
++		t.Fatalf("last left did not go offline: %v", *sent)
++	}
++}
++
++func TestViewingReconnectAndPushNameReapply(t *testing.T) {
++	client, _ := newHistoryClient(t)
++	owner, clock, sent := newViewingTestOwner(t)
++	client.viewingOnce.Do(func() { client.viewing = owner })
++	applyViewing(t, owner, viewingMac, 1, "!a:example.invalid", true)
++	// Connected, PushNameSetting e AppStateSyncComplete usam este seam real.
++	if err := client.updatePresence(context.Background(), types.PresenceUnavailable); err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(*sent, []types.Presence{types.PresenceAvailable, types.PresenceUnavailable, types.PresenceAvailable}) {
++		t.Fatalf("valid lease not reapplied: %v", *sent)
++	}
++	clock.advance(viewingLeaseTTL)
++	if err := client.updatePresence(context.Background(), types.PresenceUnavailable); err != nil {
++		t.Fatal(err)
++	}
++	if (*sent)[len(*sent)-1] != types.PresenceUnavailable {
++		t.Fatal("expired lease reapplied after reconnect")
++	}
++}
++
++func TestViewingSendFailuresRetryWithoutExtending(t *testing.T) {
++	owner, clock, sent := newViewingTestOwner(t)
++	failure := errors.New("synthetic send failure")
++	succeed := owner.send
++	owner.send = func(context.Context, types.Presence) error { return failure }
++	accepted, err := owner.apply(context.Background(), viewingMac, 1, "!a:example.invalid")
++	if !accepted || !errors.Is(err, failure) {
++		t.Fatalf("failure lost: %v", err)
++	}
++	if owner.confirmed != "" {
++		t.Fatal("failed presence marked confirmed")
++	}
++	owner.send = succeed
++	clock.advance(time.Second)
++	if len(*sent) != 1 || (*sent)[0] != types.PresenceAvailable {
++		t.Fatal("failed available not retried")
++	}
++	owner.send = func(context.Context, types.Presence) error { return failure }
++	clock.advance(14 * time.Second)
++	if owner.confirmed != "" {
++		t.Fatal("failed offline marked confirmed")
++	}
++	owner.send = succeed
++	clock.advance(time.Second)
++	if len(*sent) != 2 || (*sent)[1] != types.PresenceUnavailable {
++		t.Fatal("failed offline not retried")
++	}
++	applyViewing(t, owner, viewingMac, 1, "!a:example.invalid", false)
++	if len(*sent) != 2 {
++		t.Fatal("retry extended expired lease")
++	}
++}
++
++func TestViewingStopAndRestart(t *testing.T) {
++	owner, clock, sent := newViewingTestOwner(t)
++	applyViewing(t, owner, viewingMac, 1, "!a:example.invalid", true)
++	owner.stop()
++	clock.advance(time.Hour)
++	if len(*sent) != 1 {
++		t.Fatal("stopped owner sent presence")
++	}
++	if _, err := owner.apply(context.Background(), viewingMac, 2, "!a:example.invalid"); !errors.Is(err, errViewingStopped) {
++		t.Fatal("stopped owner accepted request")
++	}
++	restarted, _, fresh := newViewingTestOwner(t)
++	if err := restarted.legacy(context.Background(), types.PresenceUnavailable); err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(*fresh, []types.Presence{types.PresenceUnavailable}) {
++		t.Fatal("restart restored online state")
++	}
++}
++
++func TestViewingConcurrentRequestsAndReconnect(t *testing.T) {
++	owner, _, sent := newViewingTestOwner(t)
++	var wait sync.WaitGroup
++	for generation := uint64(1); generation <= 100; generation++ {
++		wait.Add(1)
++		go func() {
++			defer wait.Done()
++			if _, err := owner.apply(context.Background(), viewingMac, generation, "!a:example.invalid"); err != nil {
++				t.Error(err)
++			}
++			if err := owner.legacy(context.Background(), types.PresenceUnavailable); err != nil {
++				t.Error(err)
++			}
++		}()
++	}
++	wait.Wait()
++	if owner.generation(viewingMac) != 100 {
++		t.Fatal("highest generation lost")
++	}
++	applyViewing(t, owner, viewingMac, 101, "", true)
++	if (*sent)[len(*sent)-1] != types.PresenceUnavailable {
++		t.Fatal("concurrent reconnect won over last left")
++	}
++}
+diff --git a/pkg/connector/viewing_typing_test.go b/pkg/connector/viewing_typing_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..da8a9c21b8d4d4a7e0177b5ea7fede869a7bd164
+--- /dev/null
++++ b/pkg/connector/viewing_typing_test.go
+@@ -0,0 +1,151 @@
++package connector
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++
++	"go.mau.fi/whatsmeow/types"
++	"go.mau.fi/whatsmeow/types/events"
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/bridgev2/database"
++	"maunium.net/go/mautrix/bridgev2/networkid"
++	"maunium.net/go/mautrix/id"
++
++	"go.mau.fi/mautrix-whatsapp/pkg/waid"
++)
++
++type viewingChatSender struct {
++	chat  types.JID
++	state types.ChatPresence
++	media types.ChatPresenceMedia
++	calls int
++	err   error
++}
++
++func (sender *viewingChatSender) SendChatPresence(_ context.Context, chat types.JID, state types.ChatPresence, media types.ChatPresenceMedia) error {
++	sender.chat, sender.state, sender.media = chat, state, media
++	sender.calls++
++	return sender.err
++}
++
++func TestViewingOutgoingTypingUnchanged(t *testing.T) {
++	for _, typing := range []bool{true, false} {
++		for _, kind := range []bridgev2.TypingType{bridgev2.TypingTypeText, bridgev2.TypingTypeRecordingMedia, bridgev2.TypingTypeUploadingMedia} {
++			for _, focused := range []bool{true, false} {
++				client, _ := newHistoryClient(t)
++				owner, _, sent := newViewingTestOwner(t)
++				client.viewingOnce.Do(func() { client.viewing = owner })
++				if focused {
++					applyViewing(t, owner, viewingMac, 1, "!typing:example.invalid", true)
++				}
++				sender := &viewingChatSender{err: errors.New("synthetic typing send failure")}
++				chat := types.NewJID("100000000002", types.HiddenUserServer)
++				msg := &bridgev2.MatrixTyping{Portal: &bridgev2.Portal{Portal: &database.Portal{PortalKey: networkid.PortalKey{ID: waid.MakePortalID(chat)}}}, IsTyping: typing, Type: kind}
++				err := client.handleMatrixTyping(context.Background(), msg, sender)
++				if kind == bridgev2.TypingTypeUploadingMedia {
++					if err != nil || sender.calls != 0 {
++						t.Fatal("uploading-media must not send chat presence")
++					}
++					continue
++				}
++				wantState, wantMedia := types.ChatPresencePaused, types.ChatPresenceMediaText
++				if typing {
++					wantState = types.ChatPresenceComposing
++				}
++				if kind == bridgev2.TypingTypeRecordingMedia {
++					wantMedia = types.ChatPresenceMediaAudio
++				}
++				if !errors.Is(err, sender.err) || sender.calls != 1 || sender.chat != chat || sender.state != wantState || sender.media != wantMedia {
++					t.Fatalf("typing changed: %+v err=%v", sender, err)
++				}
++				wantPresenceCalls := 0
++				if focused {
++					wantPresenceCalls = 1
++				}
++				if len(*sent) != wantPresenceCalls {
++					t.Fatal("typing modified viewing presence")
++				}
++				if err = client.HandleMatrixTyping(context.Background(), msg); err == nil {
++					t.Fatal("public typing handler must propagate concrete disconnected transport failure")
++				}
++			}
++		}
++	}
++}
++
++type viewingTypingCall struct {
++	room    id.RoomID
++	kind    bridgev2.TypingType
++	timeout time.Duration
++}
++
++type viewingTypingMatrix struct {
++	*historyMatrix
++	calls []viewingTypingCall
++}
++
++type viewingTypingIntent struct {
++	*historyIntent
++	matrix *viewingTypingMatrix
++}
++
++func (mx *viewingTypingMatrix) GhostIntent(user networkid.UserID) bridgev2.MatrixAPI {
++	return &viewingTypingIntent{historyIntent: &historyIntent{matrix: mx.historyMatrix, mxid: mx.FormatGhostMXID(user)}, matrix: mx}
++}
++
++func (intent *viewingTypingIntent) EnsureInvited(context.Context, id.RoomID, id.UserID) error {
++	return nil
++}
++
++func (intent *viewingTypingIntent) MarkTyping(_ context.Context, room id.RoomID, kind bridgev2.TypingType, timeout time.Duration) error {
++	intent.matrix.calls = append(intent.matrix.calls, viewingTypingCall{room, kind, timeout})
++	return nil
++}
++
++func TestViewingIncomingTypingUnchanged(t *testing.T) {
++	client, history := newHistoryClient(t)
++	mx := &viewingTypingMatrix{historyMatrix: history}
++	client.Main.Bridge.Matrix = mx
++	client.Main.Bridge.Bot = &viewingTypingIntent{historyIntent: history.bot, matrix: mx}
++	chat := types.NewJID("100000000002", types.HiddenUserServer)
++	ctx := context.Background()
++	portal, err := client.Main.Bridge.GetPortalByKey(ctx, client.makeWAPortalKey(chat))
++	if err != nil {
++		t.Fatal(err)
++	}
++	client.UserLogin.MarkInPortal(ctx, portal)
++	portal.MXID = "!typing:example.invalid"
++	if err = portal.Save(ctx); err != nil {
++		t.Fatal(err)
++	}
++	owner, _, _ := newViewingTestOwner(t)
++	client.viewingOnce.Do(func() { client.viewing = owner })
++	for _, focused := range []bool{true, false} {
++		if focused {
++			applyViewing(t, owner, viewingMac, 1, string(portal.MXID), true)
++		} else {
++			applyViewing(t, owner, viewingMac, 2, "", true)
++		}
++		for _, state := range []types.ChatPresence{types.ChatPresenceComposing, types.ChatPresencePaused} {
++			for _, media := range []types.ChatPresenceMedia{types.ChatPresenceMediaText, types.ChatPresenceMediaAudio} {
++				before := len(mx.calls)
++				client.handleWAChatPresence(ctx, &events.ChatPresence{MessageSource: types.MessageSource{Chat: chat, Sender: chat}, State: state, Media: media})
++				if len(mx.calls) != before+1 {
++					t.Fatal("incoming typing did not reach Matrix")
++				}
++				want := viewingTypingCall{room: portal.MXID, kind: bridgev2.TypingTypeText, timeout: 15 * time.Second}
++				if state == types.ChatPresencePaused {
++					want.timeout = 0
++				}
++				if media == types.ChatPresenceMediaAudio {
++					want.kind = bridgev2.TypingTypeRecordingMedia
++				}
++				if mx.calls[before] != want {
++					t.Fatalf("incoming typing=%+v want=%+v", mx.calls[before], want)
++				}
++			}
++		}
++	}
++}

@@ -1,0 +1,77 @@
+diff --git a/pkg/igconnector/chatinfo.go b/pkg/igconnector/chatinfo.go
+index 50c5fc1..6b5f6df 100644
+--- a/pkg/igconnector/chatinfo.go
++++ b/pkg/igconnector/chatinfo.go
+@@ -78,13 +78,17 @@ func (ic *IGClient) wrapUserInfo(info *slidetypes.User) *bridgev2.UserInfo {
+ 	if info.Username != "" {
+ 		identifiers = []string{fmt.Sprintf("instagram:%s", info.Username)}
+ 	}
+-	return &bridgev2.UserInfo{
+-		Identifiers: identifiers,
+-		Name: new(ic.Main.Config.FormatDisplayname(DisplaynameParams{
++	var name *string
++	if info.FullName != "" || info.Username != "" {
++		name = new(ic.Main.Config.FormatDisplayname(DisplaynameParams{
+ 			DisplayName: info.FullName,
+ 			Username:    info.Username,
+ 			ID:          info.InteropMessagingUserFBID,
+-		})),
++		}))
++	}
++	return &bridgev2.UserInfo{
++		Identifiers:  identifiers,
++		Name:         name,
+ 		Avatar:       wrapAvatar(info.ProfilePicURL),
+ 		IsBot:        new(info.AIAgentType != ""),
+ 		ExtraUpdates: ic.updateGhostIGID(info.Username, info.ID, info.InteropMessagingUserFBID),
+diff --git a/pkg/igconnector/ghost_profile_update_test.go b/pkg/igconnector/ghost_profile_update_test.go
+new file mode 100644
+index 0000000..196f849
+--- /dev/null
++++ b/pkg/igconnector/ghost_profile_update_test.go
+@@ -0,0 +1,32 @@
++package igconnector
++
++import (
++	"testing"
++
++	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
++)
++
++func TestWrapUserInfoLeavesNameUnsetWithoutIdentity(t *testing.T) {
++	config := Config{DisplaynameTemplate: "{{.DisplayName}}"}
++	if err := config.PostProcess(); err != nil {
++		t.Fatalf("failed to configure test client: %v", err)
++	}
++	client := &IGClient{Main: &IGConnector{Config: config}}
++
++	empty := client.wrapUserInfo(&slidetypes.User{})
++	if empty.Name != nil {
++		t.Fatalf("empty profile name = %q, want nil", *empty.Name)
++	}
++
++	named := client.wrapUserInfo(&slidetypes.User{FullName: "Known person"})
++	if named.Name == nil || *named.Name != "Known person" {
++		t.Fatalf("named profile name = %v, want Known person", named.Name)
++	}
++}
++
++func TestUpdateGhostFromEventSkipsEmptyIdentity(t *testing.T) {
++	client := &IGClient{}
++	sender := &slidetypes.MessageSender{UserDict: slidetypes.User{InteropMessagingUserFBID: 1}}
++
++	client.updateGhostFromEvent(sender)
++}
+diff --git a/pkg/igconnector/handlemeta.go b/pkg/igconnector/handlemeta.go
+--- a/pkg/igconnector/handlemeta.go
++++ b/pkg/igconnector/handlemeta.go
+@@ -414,7 +414,8 @@ func (ic *IGClient) handleMessage(portalKey networkid.PortalKey, msg *slidetypes
+ }
+ 
+ func (ic *IGClient) updateGhostFromEvent(sender *slidetypes.MessageSender) {
+-	if sender == nil || sender.UserDict.InteropMessagingUserFBID == 0 {
++	if sender == nil || sender.UserDict.InteropMessagingUserFBID == 0 ||
++		(sender.UserDict.FullName == "" && sender.UserDict.Username == "") {
+ 		return
+ 	}
+ 	log := ic.UserLogin.Log.With().

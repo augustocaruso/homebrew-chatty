@@ -1,0 +1,1466 @@
+diff --git a/appstate.go b/appstate.go
+index 60157c33484b2370326e200b3066024b327058d9..9a22914e0d05ee8be11205f570575bd708df19ed 100644
+--- a/appstate.go
++++ b/appstate.go
+@@ -11,6 +11,7 @@ import (
+ 	"encoding/hex"
+ 	"errors"
+ 	"fmt"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/rs/zerolog"
+@@ -67,7 +68,7 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
+ 	wantSnapshot := fullSync
+ 	var eventsToDispatch []any
+ 	eventsToDispatchPtr := &eventsToDispatch
+-	if fullSync && !cli.EmitAppStateEventsOnFullSync {
++	if fullSync && !cli.EmitAppStateEventsOnFullSync && !cli.EmitFavoriteStickerEvents {
+ 		eventsToDispatchPtr = nil
+ 	}
+ 	for hasMore {
+@@ -89,6 +90,7 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
+ 			return nil, err
+ 		}
+ 	}
++	eventsToDispatch = cli.finishFavoriteStickerSync(name, eventsToDispatch, fullSync)
+ 	if fullSync {
+ 		cli.Log.Debugf("Full sync of app state %s completed. Current version: %d", name, state.Version)
+ 		eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncComplete{Name: name, Version: state.Version})
+@@ -111,7 +113,7 @@ func (cli *Client) handleAppStateRecovery(
+ 	}
+ 	var eventsToDispatch []any
+ 	eventsToDispatchPtr := &eventsToDispatch
+-	if !cli.EmitAppStateEventsOnFullSync {
++	if !cli.EmitAppStateEventsOnFullSync && !cli.EmitFavoriteStickerEvents {
+ 		eventsToDispatchPtr = nil
+ 	}
+ 	snapshot, err := appstate.ParseRecovery(result[0].GetSyncdSnapshotFatalRecoveryResponse())
+@@ -120,6 +122,12 @@ func (cli *Client) handleAppStateRecovery(
+ 		return true
+ 	}
+ 	name := appstate.WAPatchName(snapshot.GetCollectionName())
++	var unlockAppState func()
++	if cli.EmitFavoriteStickerEvents && name == appstate.WAPatchRegularLow {
++		cli.appStateSyncLock.Lock()
++		unlockAppState = sync.OnceFunc(cli.appStateSyncLock.Unlock)
++		defer unlockAppState()
++	}
+ 	version := snapshot.GetVersion().GetVersion()
+ 	currentVersion, _, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
+ 	if err != nil {
+@@ -140,6 +148,10 @@ func (cli *Client) handleAppStateRecovery(
+ 		cli.Log.Warnf("Failed to collect app state events for %s: %v", reqID, err)
+ 		return true
+ 	}
++	eventsToDispatch = cli.finishFavoriteStickerSync(name, eventsToDispatch, true)
++	if unlockAppState != nil {
++		unlockAppState()
++	}
+ 	eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncComplete{Name: name, Version: version, Recovery: true})
+ 	for _, evt := range eventsToDispatch {
+ 		handlerFailed := cli.dispatchEvent(evt)
+@@ -166,9 +178,24 @@ func (cli *Client) applyAppStatePatches(
+ 		} else {
+ 			cli.dispatchEvent(&events.AppStateSyncError{Name: name, FullSync: fullSync, Error: err})
+ 		}
++		if cli.EmitFavoriteStickerEvents && name == appstate.WAPatchRegularLow && !fullSync {
++			var favorites []appstate.Mutation
++			for _, mutation := range mutations {
++				if len(mutation.Index) > 0 && mutation.Index[0] == appstate.IndexFavoriteSticker {
++					favorites = append(favorites, mutation)
++				}
++			}
++			if len(favorites) > 0 {
++				cli.queueFavoriteStickerSync(&events.FavoriteStickerSync{Mutations: favorites})
++			}
++		}
+ 		return state, fmt.Errorf("failed to decode app state %s patches: %w", name, err)
+ 	}
+-	return newState, cli.collectEventsToDispatch(ctx, name, mutations, fullSync, eventsToDispatch)
++	err = cli.collectEventsToDispatch(ctx, name, mutations, fullSync, eventsToDispatch)
++	if err == nil && !fullSync && eventsToDispatch != nil {
++		*eventsToDispatch = cli.finishFavoriteStickerSync(name, *eventsToDispatch, false)
++	}
++	return newState, err
+ }
+ 
+ func (cli *Client) collectEventsToDispatch(
+@@ -188,18 +215,45 @@ func (cli *Client) collectEventsToDispatch(
+ 			return fmt.Errorf("failed to update contact store with data from snapshot: %v", err)
+ 		}
+ 	}
++	emitGeneric := !fullSync || cli.EmitAppStateEventsOnFullSync
++	var favorites []appstate.Mutation
+ 	for _, mutation := range mutations {
+-		if eventsToDispatch != nil && mutation.Operation == waServerSync.SyncdMutation_SET {
++		if cli.EmitFavoriteStickerEvents && name == appstate.WAPatchRegularLow && len(mutation.Index) > 0 && mutation.Index[0] == appstate.IndexFavoriteSticker {
++			favorites = append(favorites, mutation)
++		}
++		if emitGeneric && eventsToDispatch != nil && mutation.Operation == waServerSync.SyncdMutation_SET {
+ 			*eventsToDispatch = append(*eventsToDispatch, &events.AppState{Index: mutation.Index, SyncActionValue: mutation.Action})
+ 		}
+ 		evt := cli.dispatchAppState(ctx, name, mutation, fullSync)
+-		if eventsToDispatch != nil && evt != nil {
++		if emitGeneric && eventsToDispatch != nil && evt != nil {
+ 			*eventsToDispatch = append(*eventsToDispatch, evt)
+ 		}
+ 	}
++	if eventsToDispatch != nil && len(favorites) > 0 {
++		*eventsToDispatch = append(*eventsToDispatch, &events.FavoriteStickerSync{Mutations: favorites, FromFullSync: fullSync})
++	}
+ 	return nil
+ }
+ 
++func (cli *Client) finishFavoriteStickerSync(name appstate.WAPatchName, collected []any, fullSync bool) []any {
++	if !cli.EmitFavoriteStickerEvents || name != appstate.WAPatchRegularLow {
++		return collected
++	}
++	batch := &events.FavoriteStickerSync{FromFullSync: fullSync}
++	result := make([]any, 0, len(collected)+1)
++	for _, raw := range collected {
++		if favorite, ok := raw.(*events.FavoriteStickerSync); ok {
++			batch.Mutations = append(batch.Mutations, favorite.Mutations...)
++		} else {
++			result = append(result, raw)
++		}
++	}
++	if fullSync || len(batch.Mutations) > 0 {
++		cli.queueFavoriteStickerSync(batch)
++	}
++	return result
++}
++
+ func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mutation, []store.ContactEntry) {
+ 	filteredMutations := mutations[:0]
+ 	contacts := make([]store.ContactEntry, 0, len(mutations))
+@@ -233,7 +287,7 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
+ 		Strs("index", mutation.Index).
+ 		Hex("index_mac", mutation.IndexMAC).
+ 		Hex("value_mac", mutation.ValueMAC)
+-	if logLevel == zerolog.TraceLevel {
++	if logLevel == zerolog.TraceLevel && (len(mutation.Index) == 0 || mutation.Index[0] != appstate.IndexFavoriteSticker) {
+ 		logEvt.Any("action", mutation.Action)
+ 	}
+ 	logEvt.Msg("Received app state mutation")
+@@ -610,7 +664,13 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
+ 			patches, err := appstate.ParsePatchList(ctx, &respCollection, cli.downloadExternalAppStateBlob)
+ 			if err != nil {
+ 				return fmt.Errorf("%w (also, parsing patches in the response failed: %w)", mainErr, err)
+-			} else if _, err = cli.applyAppStatePatches(ctx, patch.Type, state, patches, false, &eventsToDispatch); err != nil {
++			}
++			if cli.EmitFavoriteStickerEvents && patch.Type == appstate.WAPatchRegularLow {
++				_, err = cli.applyFavoriteStickerConflicts(ctx, state, patches, &eventsToDispatch)
++			} else {
++				_, err = cli.applyAppStatePatches(ctx, patch.Type, state, patches, false, &eventsToDispatch)
++			}
++			if err != nil {
+ 				return fmt.Errorf("%w (also, applying patches in the response failed: %w)", mainErr, err)
+ 			} else {
+ 				zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after applying conflicting patches")
+diff --git a/client.go b/client.go
+index dcbad5defad20d11e05fafb730a97bd074e31b13..fa64e7b3053280dc2e1b7f783ca63e22e04ab837 100644
+--- a/client.go
++++ b/client.go
+@@ -92,6 +92,10 @@ type Client struct {
+ 
+ 	sendActiveReceipts atomic.Uint32
+ 
++	EmitFavoriteStickerEvents   bool
++	favoriteStickerQueueLock    sync.Mutex
++	favoriteStickerQueue        []*events.FavoriteStickerSync
++	favoriteStickerQueueRunning bool
+ 	// EmitAppStateEventsOnFullSync can be set to true if you want to get app state events emitted
+ 	// even when re-syncing the whole state.
+ 	EmitAppStateEventsOnFullSync bool
+@@ -998,6 +1002,9 @@ func (cli *Client) dispatchEvent(evt any) (handlerFailed bool) {
+ 		cli.eventHandlersLock.RUnlock()
+ 		err := recover()
+ 		if err != nil {
++			if _, ok := evt.(*events.FavoriteStickerSync); ok {
++				handlerFailed = true
++			}
+ 			cli.Log.Errorf("Event handler panicked while handling a %T: %v\n%s", evt, err, debug.Stack())
+ 		}
+ 	}()
+diff --git a/download.go b/download.go
+index 6d5e4e5b7659bbce6b971b2a69694199ef6d9a1c..bbf38dbac7edbb97fd308b8409105ec4c9407a25 100644
+--- a/download.go
++++ b/download.go
+@@ -17,10 +17,12 @@ import (
+ 	"io"
+ 	"net"
+ 	"net/http"
++	"net/url"
+ 	"strings"
+ 	"time"
+ 
+ 	"go.mau.fi/util/retryafter"
++	"golang.org/x/net/http2"
+ 	"google.golang.org/protobuf/proto"
+ 	"google.golang.org/protobuf/reflect/protoreflect"
+ 
+@@ -262,7 +264,7 @@ func (cli *Client) DownloadMediaWithPath(
+ 		fileHash = make([]byte, 32)
+ 	}
+ 	if !strings.HasPrefix(directPath, "/") {
+-		return nil, fmt.Errorf("media download path does not start with slash: %s", directPath)
++		return nil, errors.New("media download path does not start with slash")
+ 	}
+ 	var mediaConn *MediaConn
+ 	mediaConn, err = cli.refreshMediaConn(ctx, false)
+@@ -330,8 +332,9 @@ func shouldRetryMediaDownload(err error) bool {
+ 	}
+ 	var netErr net.Error
+ 	var httpErr DownloadHTTPError
++	var streamErr http2.StreamError
+ 	return errors.As(err, &netErr) ||
+-		strings.HasPrefix(err.Error(), "stream error:") || // hacky check for http2 errors
++		errors.As(err, &streamErr) ||
+ 		(errors.As(err, &httpErr) && retryafter.Should(httpErr.StatusCode, true))
+ }
+ 
+@@ -359,13 +362,30 @@ func (cli *Client) downloadPossiblyEncryptedMediaWithRetries(ctx context.Context
+ 	return
+ }
+ 
++type mediaRequestError struct {
++	cause error
++}
++
++func (err mediaRequestError) Error() string {
++	cause := err.cause
++	if requestError, ok := errors.AsType[*url.Error](cause); ok {
++		cause = requestError.Err
++	}
++	if networkError, ok := errors.AsType[net.Error](cause); ok && networkError.Timeout() {
++		return fmt.Sprintf("media HTTP request failed (timeout, %T)", cause)
++	}
++	return fmt.Sprintf("media HTTP request failed (%T)", cause)
++}
++
++func (err mediaRequestError) Unwrap() error { return err.cause }
++
+ func (cli *Client) doMediaDownloadRequest(ctx context.Context, url string) (*http.Response, error) {
+ 	if cli == nil {
+ 		return nil, ErrClientIsNil
+ 	}
+ 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+ 	if err != nil {
+-		return nil, fmt.Errorf("failed to prepare request: %w", err)
++		return nil, mediaRequestError{cause: err}
+ 	}
+ 	req.Header.Set("Origin", socket.Origin)
+ 	req.Header.Set("Referer", socket.Origin+"/")
+@@ -374,7 +394,7 @@ func (cli *Client) doMediaDownloadRequest(ctx context.Context, url string) (*htt
+ 	}
+ 	resp, err := cli.mediaHTTP.Do(req)
+ 	if err != nil {
+-		return nil, err
++		return nil, mediaRequestError{cause: err}
+ 	}
+ 	if resp.StatusCode != http.StatusOK {
+ 		_ = resp.Body.Close()
+@@ -390,6 +410,9 @@ func (cli *Client) downloadMedia(ctx context.Context, url string) ([]byte, error
+ 	}
+ 	data, err := io.ReadAll(resp.Body)
+ 	_ = resp.Body.Close()
++	if err != nil {
++		return nil, mediaRequestError{cause: err}
++	}
+ 	return data, err
+ }
+ 
+diff --git a/favorite_boundary_test.go b/favorite_boundary_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..07d2fd128dcbd871993fc79cb7bb853b419aa700
+--- /dev/null
++++ b/favorite_boundary_test.go
+@@ -0,0 +1,161 @@
++package whatsmeow
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/rs/zerolog"
++	"go.mau.fi/whatsmeow/appstate"
++	waBinary "go.mau.fi/whatsmeow/binary"
++	"go.mau.fi/whatsmeow/proto/waServerSync"
++	"go.mau.fi/whatsmeow/store"
++	"go.mau.fi/whatsmeow/types"
++	"go.mau.fi/whatsmeow/types/events"
++	waLog "go.mau.fi/whatsmeow/util/log"
++	"golang.org/x/net/http2"
++	"google.golang.org/protobuf/proto"
++)
++
++type favoriteFailedMediaBody struct{ err error }
++
++func (body favoriteFailedMediaBody) Read([]byte) (int, error) { return 0, body.err }
++func (body favoriteFailedMediaBody) Close() error             { return nil }
++
++func TestMediaHTTP2RetryPreservesPrivacy(t *testing.T) {
++	for _, favorites := range []bool{false, true} {
++		for _, source := range []string{"transport", "body"} {
++			t.Run(fmt.Sprintf("favorites_%t/%s", favorites, source), func(t *testing.T) {
++				const marker = "SYNTHETIC_PRIVATE_HTTP2_QUERY"
++				var logs bytes.Buffer
++				cli := NewClient(&store.Device{}, waLog.Zerolog(zerolog.New(&logs)))
++				cli.EmitFavoriteStickerEvents = favorites
++				calls := 0
++				streamErr := http2.StreamError{StreamID: 1, Code: http2.ErrCodeInternal, Cause: errors.New(marker)}
++				cli.SetMediaHTTPClient(&http.Client{Transport: favoriteTransport(func(req *http.Request) (*http.Response, error) {
++					calls++
++					var body io.ReadCloser = io.NopCloser(strings.NewReader("synthetic original media"))
++					if calls == 1 {
++						if source == "transport" {
++							return nil, streamErr
++						}
++						body = favoriteFailedMediaBody{err: streamErr}
++					}
++					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body, Request: req}, nil
++				})})
++				data, _, err := cli.downloadPossiblyEncryptedMediaWithRetries(context.Background(), "https://synthetic.invalid/"+marker+"?token="+marker, nil)
++				if err != nil || calls != 2 || string(data) != "synthetic original media" {
++					t.Fatalf("HTTP/2 recovery lost: calls=%d data=%q err=%v", calls, data, err)
++				}
++				if !strings.Contains(logs.String(), "retrying") || strings.Contains(logs.String(), marker) || strings.Contains(logs.String(), "https://") {
++					t.Fatalf("retry diagnosis missing or sensitive data logged: %s", &logs)
++				}
++			})
++		}
++	}
++}
++
++func TestMediaRetryUsesTypedErrors(t *testing.T) {
++	streamErr := http2.StreamError{StreamID: 1, Code: http2.ErrCodeInternal}
++	for _, scenario := range []struct {
++		name  string
++		err   error
++		retry bool
++	}{
++		{"stream", streamErr, true},
++		{"wrapped_stream", mediaRequestError{cause: fmt.Errorf("wrapped: %w", streamErr)}, true},
++		{"timeout", mediaRequestError{cause: &syntheticFavoriteNetError{}}, true},
++		{"http_retry", mediaRequestError{cause: DownloadHTTPError{Response: &http.Response{StatusCode: 503}}}, true},
++		{"http_permanent", mediaRequestError{cause: DownloadHTTPError{Response: &http.Response{StatusCode: 404}}}, false},
++		{"text_is_not_type", errors.New("stream error: synthetic permanent error"), false},
++		{"cancel", errors.Join(streamErr, context.Canceled), false},
++	} {
++		t.Run(scenario.name, func(t *testing.T) {
++			if got := shouldRetryMediaDownload(scenario.err); got != scenario.retry {
++				t.Fatalf("retry=%t, want %t", got, scenario.retry)
++			}
++		})
++	}
++}
++
++func (memory *favoriteMemoryStore) GetLatestAppStateSyncKeyID(context.Context) ([]byte, error) {
++	return []byte{1}, nil
++}
++
++func TestNonFavoriteConflictKeepsUpstreamValidation(t *testing.T) {
++	target := types.NewJID("12345", types.DefaultUserServer)
++	for _, patch := range []appstate.PatchInfo{
++		appstate.BuildPin(target, true),
++		appstate.BuildMarkChatAsRead(target, true, time.Time{}, nil),
++		appstate.BuildArchive(target, false, time.Time{}, nil),
++	} {
++		for _, invalid := range []string{"valid", "patch_mac", "snapshot_mac"} {
++			for _, favorites := range []bool{false, true} {
++				t.Run(fmt.Sprintf("%s/%s/favorites_%t", patch.Mutations[0].Index[0], invalid, favorites), func(t *testing.T) {
++					cli, memory := favoriteReliabilityClient(t)
++					cli.EmitFavoriteStickerEvents = favorites
++					raw, err := cli.appStateProc.EncodePatch(cli.BackgroundEventCtx, []byte{1}, appstate.HashState{}, patch)
++					if err != nil {
++						t.Fatal(err)
++					}
++					conflict := &waServerSync.SyncdPatch{}
++					if err = proto.Unmarshal(raw, conflict); err != nil {
++						t.Fatal(err)
++					}
++					conflict.Version = &waServerSync.SyncdVersion{Version: proto.Uint64(1)}
++					want := appstate.ErrMismatchingPatchMAC
++					wantCalls, wantSyncErrors := 1, 1
++					if invalid == "patch_mac" {
++						conflict.PatchMAC = make([]byte, 32)
++					} else if invalid == "snapshot_mac" {
++						conflict.SnapshotMAC = make([]byte, 32)
++						want = appstate.ErrMismatchingLTHash
++					} else {
++						want = ErrAppStateUpdate
++						wantCalls, wantSyncErrors = 2, 0
++					}
++					raw, err = proto.Marshal(conflict)
++					if err != nil {
++						t.Fatal(err)
++					}
++					calls := 0
++					favoriteLocalAppStateSocket(t, cli, func(req *waBinary.Node) waBinary.Node {
++						calls++
++						// Simulate a fetch committing while the send is in flight.
++						if calls == 1 {
++							if err := memory.PutAppStateVersion(cli.BackgroundEventCtx, "regular_low", 1, [128]byte{}); err != nil {
++								t.Error(err)
++							}
++						}
++						code := 409
++						if calls > 1 {
++							code = 500
++						}
++						content := []waBinary.Node{{Tag: "error", Attrs: waBinary.Attrs{"code": code}}, {Tag: "patches", Content: []waBinary.Node{{Tag: "patch", Content: raw}}}}
++						return waBinary.Node{Tag: "iq", Attrs: waBinary.Attrs{"id": req.Attrs["id"], "type": "result"}, Content: []waBinary.Node{{Tag: "sync", Content: []waBinary.Node{{Tag: "collection", Attrs: waBinary.Attrs{"name": "regular_low", "type": "error"}, Content: content}}}}}
++					})
++					syncErrors := 0
++					cli.AddEventHandler(func(raw any) {
++						if _, ok := raw.(*events.AppStateSyncError); ok {
++							syncErrors++
++						}
++					})
++					err = cli.SendAppState(cli.BackgroundEventCtx, patch)
++					if !errors.Is(err, want) || calls != wantCalls || syncErrors != wantSyncErrors {
++						t.Fatalf("non-favorite conflict bypassed upstream validation: err=%v want=%v sends=%d syncErrors=%d", err, want, calls, syncErrors)
++					}
++					version, hash, _ := memory.GetAppStateVersion(cli.BackgroundEventCtx, "regular_low")
++					if version != 1 || (hash == ([128]byte{})) == (invalid == "valid") {
++						t.Fatal("conflict persistence differs from upstream validation")
++					}
++				})
++			}
++		}
++	}
++}
+diff --git a/favorite_delivery.go b/favorite_delivery.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4fc4a4c8328c9b8494903375d29711f5a721183
+--- /dev/null
++++ b/favorite_delivery.go
+@@ -0,0 +1,80 @@
++package whatsmeow
++
++import (
++	"context"
++	"strings"
++	"time"
++
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/types/events"
++)
++
++func (cli *Client) queueFavoriteStickerSync(batch *events.FavoriteStickerSync) {
++	cli.favoriteStickerQueueLock.Lock()
++	defer cli.favoriteStickerQueueLock.Unlock()
++	cli.favoriteStickerQueue = append(cli.favoriteStickerQueue, batch)
++	if !cli.favoriteStickerQueueRunning {
++		cli.favoriteStickerQueueRunning = true
++		go cli.deliverFavoriteStickerSync(cli.BackgroundEventCtx)
++	}
++}
++
++func (cli *Client) deliverFavoriteStickerSync(ctx context.Context) {
++	retryDelay := time.Second
++	for {
++		cli.favoriteStickerQueueLock.Lock()
++		if ctx.Err() != nil || len(cli.favoriteStickerQueue) == 0 {
++			cli.favoriteStickerQueueRunning = false
++			cli.favoriteStickerQueueLock.Unlock()
++			return
++		}
++		batch := cli.favoriteStickerQueue[0]
++		cli.favoriteStickerQueueLock.Unlock()
++		if !cli.dispatchEvent(batch) {
++			cli.favoriteStickerQueueLock.Lock()
++			cli.favoriteStickerQueue[0] = nil
++			cli.favoriteStickerQueue = cli.favoriteStickerQueue[1:]
++			cli.favoriteStickerQueueLock.Unlock()
++			retryDelay = time.Second
++			continue
++		}
++		select {
++		case <-ctx.Done():
++		case <-time.After(retryDelay):
++		}
++		cli.favoriteStickerQueueLock.Lock()
++		if len(cli.favoriteStickerQueue) > 1 {
++			cli.favoriteStickerQueue = []*events.FavoriteStickerSync{mergePendingFavoriteStickerSync(cli.favoriteStickerQueue)}
++		}
++		cli.favoriteStickerQueueLock.Unlock()
++		retryDelay = min(retryDelay*2, 30*time.Second)
++	}
++}
++
++func mergePendingFavoriteStickerSync(batches []*events.FavoriteStickerSync) *events.FavoriteStickerSync {
++	merged := &events.FavoriteStickerSync{}
++	indexes := make(map[string]int)
++	for _, batch := range batches {
++		if batch.FromFullSync {
++			merged.FromFullSync = true
++			merged.Mutations = nil
++			clear(indexes)
++		}
++		for _, mutation := range batch.Mutations {
++			key := strings.Join(mutation.Index, "\x00")
++			if index, ok := indexes[key]; ok {
++				merged.Mutations[index] = mutation
++			} else {
++				indexes[key] = len(merged.Mutations)
++				merged.Mutations = append(merged.Mutations, mutation)
++			}
++		}
++	}
++	return merged
++}
++
++func (cli *Client) applyFavoriteStickerConflicts(ctx context.Context, state appstate.HashState, patches *appstate.PatchList, collected *[]any) (appstate.HashState, error) {
++	cli.appStateSyncLock.Lock()
++	defer cli.appStateSyncLock.Unlock()
++	return cli.applyAppStatePatches(ctx, appstate.WAPatchRegularLow, state, patches, false, collected)
++}
+diff --git a/favorite_delivery_test.go b/favorite_delivery_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..c160c41b13c82e263aee6957c55dc94c18d15d22
+--- /dev/null
++++ b/favorite_delivery_test.go
+@@ -0,0 +1,106 @@
++package whatsmeow
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/proto/waServerSync"
++	"go.mau.fi/whatsmeow/proto/waSyncAction"
++	"go.mau.fi/whatsmeow/store"
++	"go.mau.fi/whatsmeow/types/events"
++	waLog "go.mau.fi/whatsmeow/util/log"
++)
++
++func captureFavoriteStickerDelivery(cli *Client) <-chan *events.FavoriteStickerSync {
++	delivered := make(chan *events.FavoriteStickerSync, 8)
++	cli.AddEventHandler(func(raw any) {
++		if batch, ok := raw.(*events.FavoriteStickerSync); ok {
++			delivered <- batch
++		}
++	})
++	return delivered
++}
++
++func awaitFavoriteStickerDelivery(t *testing.T, delivered <-chan *events.FavoriteStickerSync) *events.FavoriteStickerSync {
++	t.Helper()
++	select {
++	case batch := <-delivered:
++		return batch
++	case <-time.After(4 * time.Second):
++		t.Fatal("favorite delivery timed out")
++		return nil
++	}
++}
++
++func TestFavoriteStickerSnapshotIsolation(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		for _, full := range []bool{false, true} {
++			cli := NewClient(&store.Device{}, waLog.Noop)
++			cli.EmitFavoriteStickerEvents = enabled
++			delivered := captureFavoriteStickerDelivery(cli)
++			var collected []any
++			mutations := []appstate.Mutation{
++				{Operation: waServerSync.SyncdMutation_SET, Index: []string{appstate.IndexFavoriteSticker, "one"}, Action: &waSyncAction.SyncActionValue{}},
++				{Operation: waServerSync.SyncdMutation_REMOVE, Index: []string{appstate.IndexFavoriteSticker, "two"}},
++				{Operation: waServerSync.SyncdMutation_SET, Index: []string{appstate.IndexPin, "100@s.whatsapp.net"}, Action: &waSyncAction.SyncActionValue{}},
++			}
++			if err := cli.collectEventsToDispatch(context.Background(), appstate.WAPatchRegularLow, mutations, full, &collected); err != nil {
++				t.Fatal(err)
++			}
++			collected = cli.finishFavoriteStickerSync(appstate.WAPatchRegularLow, collected, full)
++			if enabled {
++				collected = append(collected, awaitFavoriteStickerDelivery(t, delivered))
++			}
++			favorites, generic, pins := 0, 0, 0
++			for _, raw := range collected {
++				switch evt := raw.(type) {
++				case *events.FavoriteStickerSync:
++					favorites++
++					if len(evt.Mutations) != 2 || evt.FromFullSync != full || evt.Mutations[1].Operation != waServerSync.SyncdMutation_REMOVE {
++						t.Fatalf("bad batch: %#v", evt)
++					}
++				case *events.AppState:
++					generic++
++				case *events.Pin:
++					pins++
++				default:
++					t.Fatalf("unexpected event: %T", raw)
++				}
++			}
++			if (enabled && favorites != 1) || (!enabled && favorites != 0) {
++				t.Fatalf("enabled=%v full=%v favorites=%d", enabled, full, favorites)
++			}
++			if (full && (generic != 0 || pins != 0)) || (!full && (generic != 2 || pins != 1)) {
++				t.Fatalf("unrelated delivery changed: full=%v generic=%d pins=%d", full, generic, pins)
++			}
++		}
++	}
++}
++
++func TestFavoriteStickerEmptyAndPagedSnapshot(t *testing.T) {
++	cli := NewClient(&store.Device{}, waLog.Noop)
++	cli.EmitFavoriteStickerEvents = true
++	delivered := captureFavoriteStickerDelivery(cli)
++	empty := cli.finishFavoriteStickerSync(appstate.WAPatchRegularLow, nil, true)
++	if batch := awaitFavoriteStickerDelivery(t, delivered); len(empty) != 0 || !batch.FromFullSync || len(batch.Mutations) != 0 {
++		t.Fatal("empty full snapshot must be observable")
++	}
++	pages := []any{
++		&events.FavoriteStickerSync{Mutations: []appstate.Mutation{{Index: []string{"favoriteSticker", "one"}}}},
++		&events.FavoriteStickerSync{Mutations: []appstate.Mutation{{Index: []string{"favoriteSticker", "two"}}}},
++	}
++	merged := cli.finishFavoriteStickerSync(appstate.WAPatchRegularLow, pages, true)
++	if batch := awaitFavoriteStickerDelivery(t, delivered); len(merged) != 0 || len(batch.Mutations) != 2 {
++		t.Fatal("snapshot pages were not combined")
++	}
++	if got := cli.finishFavoriteStickerSync(appstate.WAPatchRegularHigh, nil, true); len(got) != 0 {
++		t.Fatal("unrelated collection emitted favorites")
++	}
++	select {
++	case <-delivered:
++		t.Fatal("unrelated collection queued favorites")
++	default:
++	}
++}
+diff --git a/favorite_fetch_test.go b/favorite_fetch_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d09201ccf126b15a80dadb57ae52422116bbc63a
+--- /dev/null
++++ b/favorite_fetch_test.go
+@@ -0,0 +1,157 @@
++package whatsmeow
++
++import (
++	"context"
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/sha256"
++	"encoding/binary"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/coder/websocket"
++	"go.mau.fi/whatsmeow/appstate"
++	waBinary "go.mau.fi/whatsmeow/binary"
++	"go.mau.fi/whatsmeow/proto/waServerSync"
++	"go.mau.fi/whatsmeow/proto/waSyncAction"
++	"go.mau.fi/whatsmeow/socket"
++	waLog "go.mau.fi/whatsmeow/util/log"
++	"golang.org/x/crypto/hkdf"
++	"google.golang.org/protobuf/proto"
++)
++
++func favoriteEncodedPatch(t *testing.T, cli *Client, memory *favoriteMemoryStore, favorite bool) []byte {
++	t.Helper()
++	version, hash, _ := memory.GetAppStateVersion(context.Background(), string(appstate.WAPatchRegularLow))
++	raw, err := cli.appStateProc.EncodePatch(context.Background(), []byte{1}, appstate.HashState{Version: version, Hash: hash}, appstate.PatchInfo{
++		Type:      appstate.WAPatchRegularLow,
++		Mutations: []appstate.MutationInfo{{Index: []string{appstate.IndexFavoriteSticker, "synthetic"}, Version: 1, Value: &waSyncAction.SyncActionValue{StickerAction: &waSyncAction.StickerAction{IsFavorite: proto.Bool(favorite)}}}},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	patch := &waServerSync.SyncdPatch{}
++	if err = proto.Unmarshal(raw, patch); err != nil {
++		t.Fatal(err)
++	}
++	patch.Version = &waServerSync.SyncdVersion{Version: proto.Uint64(version + 1)}
++	raw, err = proto.Marshal(patch)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return raw
++}
++
++func favoriteLocalFetchSocket(t *testing.T, cli *Client, nextPatch func() []byte) {
++	t.Helper()
++	favoriteLocalAppStateSocket(t, cli, func(request *waBinary.Node) waBinary.Node {
++		return waBinary.Node{Tag: "iq", Attrs: waBinary.Attrs{"id": request.Attrs["id"], "type": "result"}, Content: []waBinary.Node{{Tag: "sync", Content: []waBinary.Node{{Tag: "collection", Attrs: waBinary.Attrs{"name": "regular_low"}, Content: []waBinary.Node{{Tag: "patches", Content: []waBinary.Node{{Tag: "patch", Content: nextPatch()}}}}}}}}}
++	})
++}
++
++func favoriteLocalAppStateSocket(t *testing.T, cli *Client, respond func(*waBinary.Node) waBinary.Node) {
++	t.Helper()
++	const pattern = "synthetic-favorite-fetch-test"
++	salt := sha256.Sum256([]byte(pattern))
++	keys := make([]byte, 64)
++	if _, err := io.ReadFull(hkdf.New(sha256.New, nil, salt[:], nil), keys); err != nil {
++		t.Fatal(err)
++	}
++	makeCipher := func(key []byte) cipher.AEAD {
++		block, err := aes.NewCipher(key)
++		if err != nil {
++			t.Fatal(err)
++		}
++		aead, err := cipher.NewGCM(block)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return aead
++	}
++	readKey, writeKey := makeCipher(keys[:32]), makeCipher(keys[32:])
++	nonce := func(count uint32) []byte {
++		iv := make([]byte, 12)
++		binary.BigEndian.PutUint32(iv[8:], count)
++		return iv
++	}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
++		if err != nil {
++			t.Error(err)
++			return
++		}
++		defer conn.CloseNow()
++		for count := uint32(0); ; count++ {
++			_, frame, err := conn.Read(r.Context())
++			if err != nil {
++				return
++			}
++			if len(frame) < 3 {
++				t.Error("short synthetic frame")
++				return
++			}
++			payload, err := readKey.Open(nil, nonce(count), frame[3:], nil)
++			if err != nil {
++				t.Error(err)
++				return
++			}
++			payload, err = waBinary.Unpack(payload)
++			if err != nil {
++				t.Error(err)
++				return
++			}
++			request, err := waBinary.Unmarshal(payload)
++			if err != nil {
++				t.Error(err)
++				return
++			}
++			if request.Attrs["xmlns"] != "w:sync:app:state" {
++				t.Error("unexpected synthetic IQ namespace")
++				return
++			}
++			response, err := waBinary.Marshal(respond(request))
++			if err != nil {
++				t.Error(err)
++				return
++			}
++			encrypted := writeKey.Seal(nil, nonce(count), response, nil)
++			length := len(encrypted)
++			framed := append([]byte{byte(length >> 16), byte(length >> 8), byte(length)}, encrypted...)
++			if err = conn.Write(r.Context(), websocket.MessageBinary, framed); err != nil {
++				return
++			}
++		}
++	}))
++	t.Cleanup(server.Close)
++	frames := socket.NewFrameSocket(waLog.Noop, server.Client())
++	frames.URL = "ws" + strings.TrimPrefix(server.URL, "http")
++	frames.Header = nil
++	if err := frames.Connect(cli.BackgroundEventCtx); err != nil {
++		t.Fatal(err)
++	}
++	handshake := socket.NewNoiseHandshake()
++	handshake.Start(pattern, nil)
++	noise, err := handshake.Finish(frames, func(ctx context.Context, frame []byte) {
++		payload, unpackErr := waBinary.Unpack(frame)
++		if unpackErr != nil {
++			t.Error(unpackErr)
++			return
++		}
++		node, decodeErr := waBinary.Unmarshal(payload)
++		if decodeErr != nil {
++			t.Error(decodeErr)
++			return
++		}
++		if !cli.receiveResponse(ctx, node) {
++			t.Error("synthetic IQ response had no waiter")
++		}
++	}, func(context.Context, *socket.NoiseSocket, bool) {})
++	if err != nil {
++		t.Fatal(err)
++	}
++	cli.socket = noise
++	t.Cleanup(func() { noise.Stop(true, false) })
++}
+diff --git a/favorite_queue_test.go b/favorite_queue_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..b0eb8984f19690cfae12d2c749c0b64410187421
+--- /dev/null
++++ b/favorite_queue_test.go
+@@ -0,0 +1,124 @@
++package whatsmeow
++
++import (
++	"context"
++	"testing"
++
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/proto/waE2E"
++	"go.mau.fi/whatsmeow/proto/waServerSync"
++	"go.mau.fi/whatsmeow/proto/waSyncdSnapshotRecovery"
++	"go.mau.fi/whatsmeow/types/events"
++	"google.golang.org/protobuf/proto"
++)
++
++func (memory *favoriteMemoryStore) DeleteAppStateVersion(context.Context, string) error {
++	memory.mu.Lock()
++	defer memory.mu.Unlock()
++	memory.state = appstate.HashState{}
++	clear(memory.macs)
++	return nil
++}
++
++func TestFavoriteConflictKeepsInputStateAndOrder(t *testing.T) {
++	cli, memory := favoriteReliabilityClient(t)
++	delivered := captureFavoriteStickerDelivery(cli)
++	first := &waServerSync.SyncdPatch{}
++	if err := proto.Unmarshal(favoriteEncodedPatch(t, cli, memory, true), first); err != nil {
++		t.Fatal(err)
++	}
++	var collected []any
++	if _, err := cli.applyAppStatePatches(cli.BackgroundEventCtx, appstate.WAPatchRegularLow, appstate.HashState{}, &appstate.PatchList{Name: appstate.WAPatchRegularLow, Patches: []*waServerSync.SyncdPatch{first}}, false, &collected); err != nil {
++		t.Fatal(err)
++	}
++	_ = awaitFavoriteStickerDelivery(t, delivered)
++	next := &waServerSync.SyncdPatch{}
++	if err := proto.Unmarshal(favoriteEncodedPatch(t, cli, memory, false), next); err != nil {
++		t.Fatal(err)
++	}
++	version, hash, _ := memory.GetAppStateVersion(cli.BackgroundEventCtx, "regular_low")
++	input := appstate.HashState{Version: version, Hash: hash}
++	if err := memory.PutAppStateVersion(cli.BackgroundEventCtx, "regular_low", 2, hash); err != nil {
++		t.Fatal(err)
++	}
++	state, err := cli.applyFavoriteStickerConflicts(cli.BackgroundEventCtx, input, &appstate.PatchList{Name: appstate.WAPatchRegularLow, Patches: []*waServerSync.SyncdPatch{next}}, &collected)
++	if err != nil {
++		t.Fatal(err)
++	}
++	batch := awaitFavoriteStickerDelivery(t, delivered)
++	if state.Version != 2 || len(batch.Mutations) != 1 || batch.Mutations[0].Action.GetStickerAction().GetIsFavorite() {
++		t.Fatal("conflict replay duplicated or reordered an already committed favorite")
++	}
++}
++
++func TestFavoriteRecoveryQueuesCompleteSnapshot(t *testing.T) {
++	cli, memory := favoriteReliabilityClient(t)
++	delivered := captureFavoriteStickerDelivery(cli)
++	completed := false
++	cli.AddEventHandlerWithSuccessStatus(func(raw any) bool {
++		if _, ok := raw.(*events.AppStateSyncComplete); !ok {
++			return true
++		}
++		if !cli.appStateSyncLock.TryLock() {
++			t.Error("recovery held app-state lock across an external callback")
++			return false
++		}
++		cli.appStateSyncLock.Unlock()
++		if err := cli.FetchAppState(cli.BackgroundEventCtx, appstate.WAPatchRegularLow, false, true); err != nil {
++			t.Error(err)
++			return false
++		}
++		completed = true
++		return true
++	})
++	raw, err := proto.Marshal(&waSyncdSnapshotRecovery.SyncdSnapshotRecovery{CollectionName: proto.String("regular_low"), Version: &waSyncdSnapshotRecovery.SyncdVersion{Version: proto.Uint64(3)}, CollectionLthash: make([]byte, 128)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	result := []*waE2E.PeerDataOperationRequestResponseMessage_PeerDataOperationResult{{SyncdSnapshotFatalRecoveryResponse: &waE2E.PeerDataOperationRequestResponseMessage_PeerDataOperationResult_SyncDSnapshotFatalRecoveryResponse{CollectionSnapshot: raw}}}
++	if !cli.handleAppStateRecovery(cli.BackgroundEventCtx, "synthetic-recovery", result) {
++		t.Fatal("recovery failed")
++	}
++	batch := awaitFavoriteStickerDelivery(t, delivered)
++	version, _, _ := memory.GetAppStateVersion(cli.BackgroundEventCtx, "regular_low")
++	if version != 3 || !completed || !batch.FromFullSync || len(batch.Mutations) != 0 {
++		t.Fatal("recovery did not enqueue its authoritative empty snapshot")
++	}
++	if !cli.handleAppStateRecovery(cli.BackgroundEventCtx, "synthetic-repeat", result) {
++		t.Fatal("repeated recovery failed")
++	}
++	select {
++	case <-delivered:
++		t.Fatal("already applied recovery was delivered again")
++	default:
++	}
++}
++
++func TestFavoritePendingMergeHonorsNewestSnapshot(t *testing.T) {
++	mutation := func(key string, operation waServerSync.SyncdMutation_SyncdOperation) appstate.Mutation {
++		return appstate.Mutation{Index: []string{appstate.IndexFavoriteSticker, key}, Operation: operation}
++	}
++	for _, scenario := range []struct {
++		name      string
++		batches   []*events.FavoriteStickerSync
++		full      bool
++		key       string
++		operation waServerSync.SyncdMutation_SyncdOperation
++		count     int
++	}{
++		{"newer_remove", []*events.FavoriteStickerSync{{Mutations: []appstate.Mutation{mutation("one", waServerSync.SyncdMutation_SET)}}, {Mutations: []appstate.Mutation{mutation("one", waServerSync.SyncdMutation_REMOVE)}}}, false, "one", waServerSync.SyncdMutation_REMOVE, 1},
++		{"delta_after_snapshot", []*events.FavoriteStickerSync{{FromFullSync: true, Mutations: []appstate.Mutation{mutation("one", waServerSync.SyncdMutation_SET)}}, {Mutations: []appstate.Mutation{mutation("one", waServerSync.SyncdMutation_REMOVE)}}}, true, "one", waServerSync.SyncdMutation_REMOVE, 1},
++		{"newer_empty_snapshot", []*events.FavoriteStickerSync{{Mutations: []appstate.Mutation{mutation("one", waServerSync.SyncdMutation_SET)}}, {FromFullSync: true}}, true, "", 0, 0},
++		{"newer_snapshot_replaces_pending", []*events.FavoriteStickerSync{{FromFullSync: true, Mutations: []appstate.Mutation{mutation("one", waServerSync.SyncdMutation_SET)}}, {FromFullSync: true, Mutations: []appstate.Mutation{mutation("two", waServerSync.SyncdMutation_SET)}}}, true, "two", waServerSync.SyncdMutation_SET, 1},
++	} {
++		t.Run(scenario.name, func(t *testing.T) {
++			merged := mergePendingFavoriteStickerSync(scenario.batches)
++			if merged.FromFullSync != scenario.full || len(merged.Mutations) != scenario.count {
++				t.Fatal("pending snapshot boundary changed")
++			}
++			if scenario.count != 0 && (merged.Mutations[0].Index[1] != scenario.key || merged.Mutations[0].Operation != scenario.operation) {
++				t.Fatal("latest pending mutation lost")
++			}
++		})
++	}
++}
+diff --git a/favorite_reliability_test.go b/favorite_reliability_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..2750a998a9af6f0dc022a6c9dbdedff565ef2cfc
+--- /dev/null
++++ b/favorite_reliability_test.go
+@@ -0,0 +1,424 @@
++package whatsmeow
++
++import (
++	"bytes"
++	"context"
++	"encoding/base64"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/rs/zerolog"
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/proto/waE2E"
++	"go.mau.fi/whatsmeow/proto/waServerSync"
++	"go.mau.fi/whatsmeow/proto/waSyncAction"
++	"go.mau.fi/whatsmeow/store"
++	"go.mau.fi/whatsmeow/types/events"
++	waLog "go.mau.fi/whatsmeow/util/log"
++	"google.golang.org/protobuf/proto"
++)
++
++type favoriteMemoryStore struct {
++	store.AppStateStore
++	store.AppStateSyncKeyStore
++	mu    sync.Mutex
++	state appstate.HashState
++	macs  map[string][]byte
++}
++
++func (s *favoriteMemoryStore) GetAppStateSyncKey(context.Context, []byte) (*store.AppStateSyncKey, error) {
++	return &store.AppStateSyncKey{Data: bytes.Repeat([]byte{7}, 32)}, nil
++}
++func (s *favoriteMemoryStore) PutAppStateVersion(_ context.Context, _ string, version uint64, hash [128]byte) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.state = appstate.HashState{Version: version, Hash: hash}
++	return nil
++}
++func (s *favoriteMemoryStore) GetAppStateVersion(context.Context, string) (uint64, [128]byte, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.state.Version, s.state.Hash, nil
++}
++func (s *favoriteMemoryStore) GetAppStateMutationMAC(_ context.Context, _ string, index []byte) ([]byte, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.macs[string(index)], nil
++}
++func (s *favoriteMemoryStore) PutAppStateMutationMACs(_ context.Context, _ string, _ uint64, macs []store.AppStateMutationMAC) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for _, mac := range macs {
++		s.macs[string(mac.IndexMAC)] = mac.ValueMAC
++	}
++	return nil
++}
++func (s *favoriteMemoryStore) DeleteAppStateMutationMACs(_ context.Context, _ string, indexes [][]byte) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for _, index := range indexes {
++		delete(s.macs, string(index))
++	}
++	return nil
++}
++
++func favoriteReliabilityClient(t *testing.T) (*Client, *favoriteMemoryStore) {
++	t.Helper()
++	memory := &favoriteMemoryStore{macs: make(map[string][]byte)}
++	cli := NewClient(&store.Device{AppState: memory, AppStateKeys: memory}, waLog.Noop)
++	cli.EmitFavoriteStickerEvents = true
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	cli.BackgroundEventCtx = ctx
++	t.Cleanup(cancel)
++	return cli, memory
++}
++
++func favoriteDecodedBatch(t *testing.T, cli *Client, memory *favoriteMemoryStore, favorite, full bool) []any {
++	t.Helper()
++	cli.appStateSyncLock.Lock()
++	defer cli.appStateSyncLock.Unlock()
++	version, hash, _ := memory.GetAppStateVersion(context.Background(), string(appstate.WAPatchRegularLow))
++	state := appstate.HashState{Version: version, Hash: hash}
++	raw, err := cli.appStateProc.EncodePatch(context.Background(), []byte{1}, state, appstate.PatchInfo{
++		Type:      appstate.WAPatchRegularLow,
++		Mutations: []appstate.MutationInfo{{Index: []string{appstate.IndexFavoriteSticker, "synthetic"}, Version: 1, Value: &waSyncAction.SyncActionValue{StickerAction: &waSyncAction.StickerAction{IsFavorite: proto.Bool(favorite)}}}},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	patch := &waServerSync.SyncdPatch{}
++	if err = proto.Unmarshal(raw, patch); err != nil {
++		t.Fatal(err)
++	}
++	patch.Version = &waServerSync.SyncdVersion{Version: proto.Uint64(version + 1)}
++	var collected []any
++	if _, err = cli.applyAppStatePatches(context.Background(), appstate.WAPatchRegularLow, state, &appstate.PatchList{Name: appstate.WAPatchRegularLow, Patches: []*waServerSync.SyncdPatch{patch}}, full, &collected); err != nil {
++		t.Fatal(err)
++	}
++	return cli.finishFavoriteStickerSync(appstate.WAPatchRegularLow, collected, full)
++}
++
++func favoriteDispatchCollected(cli *Client, collected []any) {
++	for _, event := range collected {
++		cli.dispatchEvent(event)
++	}
++}
++
++func favoriteAwait(t *testing.T, ch <-chan struct{}, reason string) {
++	t.Helper()
++	select {
++	case <-ch:
++	case <-time.After(4 * time.Second):
++		t.Fatal(reason)
++	}
++}
++
++func TestFavoritePublicationFailureIsRetriedAfterDecode(t *testing.T) {
++	cli, memory := favoriteReliabilityClient(t)
++	patches := make(chan []byte, 4)
++	favoriteLocalFetchSocket(t, cli, func() []byte { return <-patches })
++	var fail atomic.Bool
++	var present atomic.Bool
++	var requests atomic.Int32
++	published := make(chan struct{}, 8)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requests.Add(1)
++		if fail.Load() {
++			w.WriteHeader(http.StatusServiceUnavailable)
++			return
++		}
++		body, _ := io.ReadAll(r.Body)
++		present.Store(string(body) == "true")
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer server.Close()
++	failed := make(chan struct{}, 8)
++	cli.AddEventHandlerWithSuccessStatus(func(raw any) bool {
++		batch, ok := raw.(*events.FavoriteStickerSync)
++		if !ok {
++			return true
++		}
++		version, _, _ := memory.GetAppStateVersion(context.Background(), string(appstate.WAPatchRegularLow))
++		if version == 0 {
++			t.Error("publication happened before cryptographic persistence")
++		}
++		req, _ := http.NewRequestWithContext(cli.BackgroundEventCtx, http.MethodPut, server.URL, strings.NewReader(fmt.Sprint(batch.Mutations[len(batch.Mutations)-1].Action.GetStickerAction().GetIsFavorite())))
++		resp, err := server.Client().Do(req)
++		if err != nil {
++			return false
++		}
++		_ = resp.Body.Close()
++		if resp.StatusCode != http.StatusOK {
++			failed <- struct{}{}
++			return false
++		}
++		published <- struct{}{}
++		return true
++	})
++	favoriteDispatchCollected(cli, favoriteDecodedBatch(t, cli, memory, true, true))
++	favoriteAwait(t, published, "initial snapshot was not published")
++	fail.Store(true)
++	patches <- favoriteEncodedPatch(t, cli, memory, false)
++	if err := cli.FetchAppState(cli.BackgroundEventCtx, appstate.WAPatchRegularLow, false, false); err != nil {
++		t.Fatal(err)
++	}
++	favoriteAwait(t, failed, "publication failure was not exercised")
++	version, hash, _ := memory.GetAppStateVersion(context.Background(), string(appstate.WAPatchRegularLow))
++	fail.Store(false)
++	favoriteAwait(t, published, "lost delta: no automatic retry after publication failure")
++	if present.Load() {
++		t.Fatal("recovered publication did not remove favorite")
++	}
++	after, afterHash, _ := memory.GetAppStateVersion(context.Background(), string(appstate.WAPatchRegularLow))
++	if version != 2 || after != version || afterHash != hash {
++		t.Fatal("retry changed cryptographic version/hash")
++	}
++	before := requests.Load()
++	patches <- favoriteEncodedPatch(t, cli, memory, false)
++	if err := cli.FetchAppState(cli.BackgroundEventCtx, appstate.WAPatchRegularLow, false, false); err != nil {
++		t.Fatal(err)
++	}
++	favoriteAwait(t, published, "repeated removal was not delivered")
++	if present.Load() || requests.Load() != before+1 {
++		t.Fatal("repetition changed the final state")
++	}
++}
++
++func TestFavoriteDeliveryPreservesDecodeOrder(t *testing.T) {
++	for _, full := range []bool{false, true} {
++		t.Run(fmt.Sprint("older_full_", full), func(t *testing.T) {
++			cli, memory := favoriteReliabilityClient(t)
++			var present atomic.Bool
++			published := make(chan struct{}, 8)
++			cli.AddEventHandler(func(raw any) {
++				if batch, ok := raw.(*events.FavoriteStickerSync); ok {
++					present.Store(batch.Mutations[len(batch.Mutations)-1].Action.GetStickerAction().GetIsFavorite())
++					published <- struct{}{}
++				}
++			})
++			olderDecoded := make(chan struct{})
++			releaseOlder := make(chan struct{})
++			release := sync.OnceFunc(func() { close(releaseOlder) })
++			defer release()
++			olderDone := make(chan struct{})
++			go func() {
++				defer close(olderDone)
++				older := favoriteDecodedBatch(t, cli, memory, true, full)
++				close(olderDecoded)
++				<-releaseOlder
++				favoriteDispatchCollected(cli, older)
++			}()
++			favoriteAwait(t, olderDecoded, "older decode did not reach barrier")
++			favoriteDispatchCollected(cli, favoriteDecodedBatch(t, cli, memory, false, false))
++			release()
++			favoriteAwait(t, olderDone, "older dispatch did not finish")
++			favoriteAwait(t, published, "first batch missing")
++			favoriteAwait(t, published, "second batch missing")
++			if present.Load() {
++				t.Fatal("older SET/snapshot undid newer unfavorite after dispatch inversion")
++			}
++		})
++	}
++}
++
++func TestFavoriteFetchDispatchOrder(t *testing.T) {
++	cli, memory := favoriteReliabilityClient(t)
++	_ = memory.PutAppStateVersion(context.Background(), "regular_low", 1, [128]byte{})
++	patches := make(chan []byte, 4)
++	favoriteLocalFetchSocket(t, cli, func() []byte { return <-patches })
++	olderDecoded, releaseOlder := make(chan struct{}), make(chan struct{})
++	release := sync.OnceFunc(func() { close(releaseOlder) })
++	defer release()
++	published := make(chan struct{}, 8)
++	var present atomic.Bool
++	cli.AddEventHandler(func(raw any) {
++		if event, ok := raw.(*events.AppState); ok && event.SyncActionValue.GetStickerAction().GetIsFavorite() {
++			close(olderDecoded)
++			<-releaseOlder
++		}
++		if event, ok := raw.(*events.FavoriteStickerSync); ok {
++			present.Store(event.Mutations[len(event.Mutations)-1].Action.GetStickerAction().GetIsFavorite())
++			published <- struct{}{}
++		}
++	})
++	patches <- favoriteEncodedPatch(t, cli, memory, true)
++	done := make(chan error, 1)
++	go func() { done <- cli.FetchAppState(cli.BackgroundEventCtx, appstate.WAPatchRegularLow, false, false) }()
++	favoriteAwait(t, olderDecoded, "older fetch did not reach outer dispatch barrier")
++	patches <- favoriteEncodedPatch(t, cli, memory, false)
++	newerError := cli.FetchAppState(cli.BackgroundEventCtx, appstate.WAPatchRegularLow, false, false)
++	release()
++	if err := <-done; err != nil {
++		t.Fatal(err)
++	}
++	if newerError != nil {
++		t.Fatal(newerError)
++	}
++	favoriteAwait(t, published, "first native fetch batch missing")
++	favoriteAwait(t, published, "second native fetch batch missing")
++	if present.Load() {
++		t.Fatal("native concurrent FetchAppState published older SET after newer unfavorite")
++	}
++}
++
++func TestFavoriteFailedSetIsSupersededByRemove(t *testing.T) {
++	cli, _ := favoriteReliabilityClient(t)
++	failed, removed := make(chan struct{}, 8), make(chan struct{}, 8)
++	cli.AddEventHandlerWithSuccessStatus(func(raw any) bool {
++		batch, ok := raw.(*events.FavoriteStickerSync)
++		if !ok {
++			return true
++		}
++		if len(batch.Mutations) != 1 {
++			t.Error("pending mutations were not compacted")
++			return false
++		}
++		if batch.Mutations[0].Operation != waServerSync.SyncdMutation_REMOVE {
++			failed <- struct{}{}
++			return false
++		}
++		removed <- struct{}{}
++		return true
++	})
++	var collected []any
++	set := appstate.Mutation{Operation: waServerSync.SyncdMutation_SET, Index: []string{appstate.IndexFavoriteSticker, "synthetic"}, Action: &waSyncAction.SyncActionValue{}}
++	if err := cli.collectEventsToDispatch(cli.BackgroundEventCtx, appstate.WAPatchRegularLow, []appstate.Mutation{set}, false, &collected); err != nil {
++		t.Fatal(err)
++	}
++	favoriteDispatchCollected(cli, cli.finishFavoriteStickerSync(appstate.WAPatchRegularLow, collected, false))
++	favoriteAwait(t, failed, "failed SET was not exercised")
++	collected = nil
++	set.Operation = waServerSync.SyncdMutation_REMOVE
++	set.Action = nil
++	if err := cli.collectEventsToDispatch(cli.BackgroundEventCtx, appstate.WAPatchRegularLow, []appstate.Mutation{set}, false, &collected); err != nil {
++		t.Fatal(err)
++	}
++	favoriteDispatchCollected(cli, cli.finishFavoriteStickerSync(appstate.WAPatchRegularLow, collected, false))
++	favoriteAwait(t, removed, "failed stale SET blocked newer REMOVE")
++}
++
++func TestFavoriteDecodedPrefixSurvivesLaterDecodeFailure(t *testing.T) {
++	cli, memory := favoriteReliabilityClient(t)
++	delivered := captureFavoriteStickerDelivery(cli)
++	raw := favoriteEncodedPatch(t, cli, memory, true)
++	first := &waServerSync.SyncdPatch{}
++	if err := proto.Unmarshal(raw, first); err != nil {
++		t.Fatal(err)
++	}
++	broken := proto.Clone(first).(*waServerSync.SyncdPatch)
++	broken.Version = &waServerSync.SyncdVersion{Version: proto.Uint64(2)}
++	broken.PatchMAC = bytes.Repeat([]byte{0}, 32)
++	var collected []any
++	cli.appStateSyncLock.Lock()
++	_, err := cli.applyAppStatePatches(cli.BackgroundEventCtx, appstate.WAPatchRegularLow, appstate.HashState{}, &appstate.PatchList{Name: appstate.WAPatchRegularLow, Patches: []*waServerSync.SyncdPatch{first, broken}}, false, &collected)
++	cli.appStateSyncLock.Unlock()
++	if err == nil {
++		t.Fatal("bad later patch did not fail MAC validation")
++	}
++	version, _, _ := memory.GetAppStateVersion(cli.BackgroundEventCtx, "regular_low")
++	if version != 1 {
++		t.Fatal("fixture did not persist the valid prefix")
++	}
++	batch := awaitFavoriteStickerDelivery(t, delivered)
++	if len(batch.Mutations) != 1 || !batch.Mutations[0].Action.GetStickerAction().GetIsFavorite() {
++		t.Fatal("valid decoded prefix was lost after a later failure")
++	}
++}
++
++func TestFavoriteConsumerPanicIsRetried(t *testing.T) {
++	cli, _ := favoriteReliabilityClient(t)
++	var attempts atomic.Int32
++	published := make(chan struct{}, 1)
++	cli.AddEventHandlerWithSuccessStatus(func(raw any) bool {
++		if _, ok := raw.(*events.FavoriteStickerSync); !ok {
++			return true
++		}
++		if attempts.Add(1) == 1 {
++			panic("synthetic consumer failure")
++		}
++		published <- struct{}{}
++		return true
++	})
++	favoriteDispatchCollected(cli, cli.finishFavoriteStickerSync(appstate.WAPatchRegularLow, nil, true))
++	favoriteAwait(t, published, "consumer panic silently dropped the pending snapshot")
++}
++
++type favoriteTransport func(*http.Request) (*http.Response, error)
++
++func (f favoriteTransport) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
++
++func TestFavoriteDownloadAndTraceDoNotLeakSecrets(t *testing.T) {
++	for _, scenario := range []string{"network_retry", "host_fallback", "invalid_path", "invalid_url", "trace"} {
++		t.Run(scenario, func(t *testing.T) {
++			const marker = "SYNTHETIC_PRIVATE_QUERY_MARKER"
++			var logs bytes.Buffer
++			logger := zerolog.New(&logs).Level(zerolog.TraceLevel)
++			cli := NewClient(&store.Device{}, waLog.Zerolog(logger))
++			cli.EmitFavoriteStickerEvents = true
++			cli.mediaConnCache = &MediaConn{FetchedAt: time.Now(), TTL: 3600, Hosts: []MediaConnHost{{Hostname: "synthetic.invalid"}, {Hostname: "other.invalid"}}}
++			ctx, cancel := context.WithCancel(logger.WithContext(context.Background()))
++			defer cancel()
++			calls := 0
++			cli.SetMediaHTTPClient(&http.Client{Transport: favoriteTransport(func(req *http.Request) (*http.Response, error) {
++				calls++
++				if scenario == "network_retry" {
++					if calls == 1 {
++						return nil, &syntheticFavoriteNetError{}
++					}
++					cancel()
++					return nil, context.Canceled
++				}
++				return nil, errors.New("synthetic transport failure")
++			})})
++			path := "/synthetic?token=" + marker
++			if scenario == "invalid_path" {
++				path = "invalid?token=" + marker
++			}
++			if scenario == "invalid_url" {
++				path = "/%zz?token=" + marker
++			}
++			key := []byte("SYNTHETIC_PRIVATE_MEDIA_KEY_123456")
++			if scenario == "trace" {
++				mutation := appstate.Mutation{Index: []string{appstate.IndexFavoriteSticker, "synthetic"}, Operation: waServerSync.SyncdMutation_SET, Action: &waSyncAction.SyncActionValue{StickerAction: &waSyncAction.StickerAction{DirectPath: proto.String(path), MediaKey: key}}}
++				cli.dispatchAppState(ctx, appstate.WAPatchRegularLow, mutation, false)
++			} else {
++				_, err := cli.Download(ctx, &waE2E.StickerMessage{DirectPath: proto.String(path), MediaKey: bytes.Repeat([]byte{1}, 32), FileEncSHA256: bytes.Repeat([]byte{2}, 32)})
++				if err == nil {
++					t.Fatal("synthetic failure did not reach downloader")
++				}
++				logger.Error().Err(err).Msg("Failed to publish favorite stickers")
++				if scenario == "host_fallback" && calls != 10 {
++					t.Fatalf("did not exercise host fallback: %d", calls)
++				}
++			}
++			for _, secret := range []string{marker, string(key), base64.StdEncoding.EncodeToString(key)} {
++				if strings.Contains(logs.String(), secret) {
++					t.Fatalf("%s leaked sensitive marker in logs", scenario)
++				}
++			}
++			if scenario == "network_retry" && (!strings.Contains(logs.String(), "timeout") || !strings.Contains(logs.String(), "retrying")) {
++				t.Fatal("network timeout/retry diagnosis was lost")
++			}
++			if scenario == "host_fallback" && !strings.Contains(logs.String(), "trying with next host") {
++				t.Fatal("host fallback diagnosis was lost")
++			}
++			if scenario != "trace" && !strings.Contains(logs.String(), "Failed to publish favorite stickers") {
++				t.Fatal("operational failure was hidden")
++			}
++		})
++	}
++}
++
++type syntheticFavoriteNetError struct{}
++
++func (*syntheticFavoriteNetError) Error() string   { return "synthetic network outage" }
++func (*syntheticFavoriteNetError) Timeout() bool   { return true }
++func (*syntheticFavoriteNetError) Temporary() bool { return true }
+diff --git a/favorite_sticker_test.go b/favorite_sticker_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb2c3536db736a495089970dec092549050bb87a
+--- /dev/null
++++ b/favorite_sticker_test.go
+@@ -0,0 +1,32 @@
++package whatsmeow
++
++import (
++	"context"
++	"reflect"
++	"testing"
++
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/proto/waServerSync"
++	"go.mau.fi/whatsmeow/store"
++	waLog "go.mau.fi/whatsmeow/util/log"
++)
++
++func TestFavoriteStickerRemoveDelivery(t *testing.T) {
++	cli := NewClient(&store.Device{}, waLog.Noop)
++	// Reflection keeps this regression runnable against the unpatched dependency.
++	flag := reflect.ValueOf(cli).Elem().FieldByName("EmitFavoriteStickerEvents")
++	if flag.IsValid() {
++		flag.SetBool(true)
++	}
++	var collected []any
++	err := cli.collectEventsToDispatch(context.Background(), appstate.WAPatchRegularLow, []appstate.Mutation{{
++		Operation: waServerSync.SyncdMutation_REMOVE,
++		Index:     []string{appstate.IndexFavoriteSticker, "synthetic-file-hash"},
++	}}, false, &collected)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(collected) != 1 || reflect.TypeOf(collected[0]).String() != "*events.FavoriteStickerSync" {
++		t.Fatalf("REMOVE must reach the favorite consumer, got %#v", collected)
++	}
++}
+diff --git a/reviewer_media_test.go b/reviewer_media_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..adae7b73896b7dd767da26c6bb288bb6ab6ed9b2
+--- /dev/null
++++ b/reviewer_media_test.go
+@@ -0,0 +1,45 @@
++package whatsmeow
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++
++	"go.mau.fi/whatsmeow/store"
++	waLog "go.mau.fi/whatsmeow/util/log"
++	"golang.org/x/net/http2"
++)
++
++type reviewerMediaTransport func(*http.Request) (*http.Response, error)
++
++func (f reviewerMediaTransport) RoundTrip(r *http.Request) (*http.Response, error) {
++	return f(r)
++}
++
++type reviewerFailedBody struct{ err error }
++
++func (b reviewerFailedBody) Read([]byte) (int, error) { return 0, b.err }
++func (b reviewerFailedBody) Close() error             { return nil }
++
++// The upstream retries HTTP/2 stream errors raised while reading media bodies.
++// Exercise the same path without enabling favorite events and without network I/O.
++func TestReviewerOrdinaryMediaHTTP2Retry(t *testing.T) {
++	cli := NewClient(&store.Device{}, waLog.Noop)
++	calls := 0
++	streamErr := http2.StreamError{StreamID: 1, Code: http2.ErrCodeInternal}
++	cli.SetMediaHTTPClient(&http.Client{Transport: reviewerMediaTransport(func(req *http.Request) (*http.Response, error) {
++		calls++
++		var body io.ReadCloser = io.NopCloser(strings.NewReader("synthetic original media"))
++		if calls == 1 {
++			body = reviewerFailedBody{err: streamErr}
++		}
++		return &http.Response{StatusCode: http.StatusOK, Body: body, Header: make(http.Header), Request: req}, nil
++	})})
++	data, _, err := cli.downloadPossiblyEncryptedMediaWithRetries(context.Background(), "https://synthetic.invalid/media", nil)
++	if err != nil || calls != 2 || string(data) != "synthetic original media" {
++		t.Fatalf("ordinary media lost HTTP/2 recovery: calls=%d data=%q err=%v preservesStreamType=%v", calls, data, err, errors.Is(err, streamErr))
++	}
++}
+diff --git a/types/events/appstate.go b/types/events/appstate.go
+index a6082743b7b5bd38a7fcc3547bff40977c44739c..8c5e2a3d266dc610578d9d69076531392a63b096 100644
+--- a/types/events/appstate.go
++++ b/types/events/appstate.go
+@@ -175,6 +175,11 @@ type LabelAssociationMessage struct {
+ 	FromFullSync bool                                 // Whether the action is emitted because of a fullSync
+ }
+ 
++type FavoriteStickerSync struct {
++	Mutations    []appstate.Mutation
++	FromFullSync bool
++}
++
+ // AppState is emitted directly for new data received from app state syncing.
+ // You should generally use the higher-level events like events.Contact and events.Mute.
+ type AppState struct {
